@@ -24,9 +24,10 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-DATASET=.cache/a2v_robotwin/ep0_dataset_phys
-OUT=models/train/a2v_robotwin_ep0_lora_phys
-SPEC=wan2.1-vace-1.3b   # WanBaseSpec: supplies model_paths/tokenizer/lora defaults + drives VACE seams
+# Overridable via env (run_overfit_t2v.sh sets SPEC/OUT for the T3 base). Defaults = T1.
+DATASET="${DATASET:-.cache/a2v_robotwin/ep0_dataset_phys}"
+OUT="${OUT:-models/train/a2v_robotwin_ep0_lora_phys}"
+SPEC="${SPEC:-wan2.1-vace-1.3b}"   # WanBaseSpec: supplies model_paths/tokenizer/lora defaults + drives VACE seams
 
 ACCEL=.venv/bin/accelerate
 

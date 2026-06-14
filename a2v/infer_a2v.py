@@ -43,6 +43,43 @@ NEG_PROMPT = (
 )
 
 
+def _load_vace_weights(pipe, vace, ckpt_path: str, lora_alpha: float) -> None:
+    """Load a trained VACE checkpoint into `vace`, auto-detecting its kind.
+
+    Two training regimes produce different checkpoints (see a2v/run_overfit*.sh):
+      * LoRA-on-VACE (T1/T2, pretrained vace) -> keys contain ``lora_A``/``lora_B`` ->
+        merged via ``pipe.load_lora``.
+      * Full-param VACE (T3, from-DiT vace) -> a complete vace state dict
+        (``vace_patch_embedding.*`` / ``vace_blocks.*``) -> ``load_state_dict``. The
+        from-DiT branch MUST be trained full-param: its zero-init control entry/exit
+        (patch_embedding, after_proj) are not LoRA targets, so a LoRA there is inert.
+    """
+    from safetensors import safe_open
+
+    with safe_open(ckpt_path, "pt") as f:
+        keys = list(f.keys())
+    is_lora = any("lora_A" in k or "lora_B" in k or ".lora_" in k for k in keys)
+
+    if is_lora:
+        pipe.load_lora(vace, ckpt_path, alpha=lora_alpha)
+        print(f"Loaded VACE LoRA ({len(keys)} keys) from {ckpt_path}")
+        return
+
+    from diffsynth.core import load_state_dict
+    sd = load_state_dict(ckpt_path)
+    sd = {k: v.to(dtype=vace.vace_patch_embedding.weight.dtype,
+                  device=vace.vace_patch_embedding.weight.device) for k, v in sd.items()}
+    missing, unexpected = vace.load_state_dict(sd, strict=False)
+    print(f"Loaded full VACE state dict ({len(sd)} keys) from {ckpt_path} "
+          f"(missing={len(missing)} unexpected={len(unexpected)})")
+    if unexpected:
+        raise RuntimeError(f"Full-VACE checkpoint has unexpected keys, e.g. {unexpected[:5]}")
+    # `missing` is expected to be empty for a full vace save; a non-empty set means the
+    # checkpoint did not cover the whole branch (control entry/exit may stay at zero-init).
+    if missing:
+        print(f"  WARNING: {len(missing)} vace params not in checkpoint, e.g. {missing[:5]}")
+
+
 def load_row(dataset: Path, row_idx: int) -> dict:
     rows = []
     with (dataset / "metadata.jsonl").open(encoding="utf-8") as f:
@@ -94,7 +131,7 @@ def main() -> None:
     )
     # T2 seams: ensure VACE branch (SEAM-1) + install mask_pq-parameterized unit (SEAM-2).
     vace = provision_a2v(pipe, spec)
-    pipe.load_lora(vace, args.lora, alpha=args.lora_alpha)
+    _load_vace_weights(pipe, vace, args.lora, args.lora_alpha)
 
     video = pipe(
         prompt=row.get("prompt", "robot arm manipulation"),
