@@ -35,7 +35,7 @@ from diffsynth.diffusion import *  # noqa: E402,F401,F403  (ModelLogger, launch_
 
 from a2v.base_spec import get_spec  # noqa: E402
 from a2v.data.operators import frame_list_video_operator  # noqa: E402
-from a2v.provision import provision_a2v  # noqa: E402
+from a2v.provision import ensure_vace, provision_a2v  # noqa: E402
 
 
 def _load_stock_train_module():
@@ -45,6 +45,33 @@ def _load_stock_train_module():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def _make_training_module_cls(stock):
+    """Subclass the stock WanTrainingModule so the VACE branch is provisioned BEFORE
+    LoRA attaches.
+
+    For a base without a pretrained VACE branch (T3: T2V-1.3B), `pipe.vace` is None
+    after `from_pretrained`. The stock constructor then calls
+    `switch_pipe_to_training_mode`, whose LoRA step bails out with "No vace models..."
+    when `pipe.vace is None` (training_module.py:289-292). We hook that method to
+    `ensure_vace` first (create-from-DiT), so LoRA patches the freshly built branch.
+    For VACE-1.3B the hook is a no-op (vace already loaded) -> T2 path unchanged.
+    """
+
+    class A2VWanTrainingModule(stock.WanTrainingModule):
+        def __init__(self, *args, a2v_spec=None, **kwargs):
+            # Set before super().__init__ (which calls switch_*). Bypass nn.Module's
+            # __setattr__ since _parameters/_modules don't exist yet at this point.
+            object.__setattr__(self, "_a2v_spec", a2v_spec)
+            super().__init__(*args, **kwargs)
+
+        def switch_pipe_to_training_mode(self, pipe, *args, **kwargs):
+            if getattr(self, "_a2v_spec", None) is not None:
+                ensure_vace(pipe, self._a2v_spec)  # T3: build vace; T2: idempotent no-op
+            return super().switch_pipe_to_training_mode(pipe, *args, **kwargs)
+
+    return A2VWanTrainingModule
 
 
 def main() -> None:
@@ -105,7 +132,9 @@ def main() -> None:
         },
     )
 
-    model = stock.WanTrainingModule(
+    training_module_cls = _make_training_module_cls(stock)
+    model = training_module_cls(
+        a2v_spec=spec,
         model_paths=args.model_paths,
         model_id_with_origin_paths=args.model_id_with_origin_paths,
         tokenizer_path=args.tokenizer_path,
@@ -129,8 +158,11 @@ def main() -> None:
         max_timestep_boundary=args.max_timestep_boundary,
         min_timestep_boundary=args.min_timestep_boundary,
     )
-    # T2 seams: ensure VACE branch (SEAM-1) + install mask_pq-parameterized unit (SEAM-2).
-    # No-op vs stock for Wan2.1-VACE-1.3B (pretrained vace, mask_pq=8); required for T5 (mask_pq=16).
+    # Install the mask_pq-parameterized VACE unit (SEAM-2). ensure_vace here is the
+    # idempotent no-op companion to the in-constructor hook above: for T3 the branch was
+    # already built (and LoRA-patched) before switch_*, so this only swaps the unit; for
+    # VACE-1.3B it is the same no-op as T2 (pretrained vace, mask_pq=8). Required for T5
+    # (mask_pq=16).
     if spec is not None:
         provision_a2v(model.pipe, spec)
 

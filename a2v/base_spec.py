@@ -85,6 +85,23 @@ REGISTRY: dict[str, WanBaseSpec] = {
         vace_layers=tuple(range(0, 30, 2)),       # 15 layers
         first_frame_mode="vace_reference",
     ),
+    # T3: Wan2.1-T2V-1.3B ships NO VACE branch -> SEAM-1 builds one from the DiT
+    # (provision.create_vace_from_dit: clone DiT blocks + zero-init). Same 1.3B dims
+    # / Wan2.1 VAE as VACE-1.3B; the ONLY new variable vs T2 is has_pretrained_vace=False
+    # (+ first_frame_mode="none"). dit_path is the official T2V DiT (no vace_* keys).
+    "wan2.1-t2v-1.3b": WanBaseSpec(
+        name="wan2.1-t2v-1.3b",
+        dit_path="models/Wan-AI/Wan2.1-T2V-1.3B/diffusion_pytorch_model.safetensors",
+        vae_path=f"{_CONVERTED}/Wan2.1_VAE.safetensors",
+        t5_path=f"{_CONVERTED}/models_t5_umt5-xxl-enc-bf16.safetensors",
+        tokenizer_path="models/Wan-AI/Wan2.1-T2V-1.3B/google/umt5-xxl",
+        dim=1536, num_layers=30, num_heads=12, ffn_dim=8960,
+        vae_z_dim=16, vae_spatial_factor=8,
+        has_pretrained_vace=False,                # SEAM-1: create_vace_from_dit
+        vace_layers=tuple(range(0, 30, 2)),       # 15 layers (same as VACE-1.3B)
+        first_frame_mode="none",                  # T2V has no native first-frame path
+        # vace_remove_prefix defaults to "pipe.vace." -> LoRA saves as vace_blocks.*
+    ),
 }
 
 
