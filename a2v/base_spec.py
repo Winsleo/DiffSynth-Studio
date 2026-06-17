@@ -14,6 +14,7 @@ Derived, never hardcoded (the three numbers that bite — master plan §1):
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from glob import glob
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -39,6 +40,14 @@ class WanBaseSpec:
     num_heads: int
     ffn_dim: int
     patch_size: tuple = (1, 2, 2)
+    # Sharded DiT (14B is split into diffusion_pytorch_model-0000N-of-00007.safetensors):
+    # when set, model_paths() expands this repo-relative glob into the sorted shard list
+    # and uses it as the (single) DiT entry instead of `dit_path`. ModelConfig.path
+    # accepts list[str], so the loader merges the shards into one DiT.
+    dit_glob: str = ""
+    # I2V bases need a CLIP image encoder (SEAM-4 i2v_concat). When set it is appended as
+    # an extra model_paths() entry; the loader auto-detects it as wan_video_image_encoder.
+    image_encoder_path: str = ""
     # --- VAE (SEAM-2) ---
     vae_z_dim: int = 16
     vae_spatial_factor: int = 8
@@ -62,9 +71,26 @@ class WanBaseSpec:
     def mask_pq(self) -> int:
         return self.vae_spatial_factor
 
-    def model_paths(self) -> list[str]:
-        """Absolute local paths in DiT, T5, VAE order (matches T1 --model_paths)."""
-        return [_abs(self.dit_path), _abs(self.t5_path), _abs(self.vae_path)]
+    def model_paths(self) -> list:
+        """Local model paths for from_pretrained / --model_paths.
+
+        Order is DiT, T5, VAE (matches T1), with the DiT entry being either a single
+        path (1.3B) or — for sharded 14B bases — a list of shard paths (ModelConfig.path
+        accepts list[str], so the shards merge into one DiT). An I2V CLIP image encoder
+        is appended last when `image_encoder_path` is set. Loader type-detects each entry,
+        so trailing extras are order-independent.
+        """
+        if self.dit_glob:
+            shards = sorted(glob(_abs(self.dit_glob)))
+            if not shards:
+                raise FileNotFoundError(f"{self.name}: dit_glob matched no files: {self.dit_glob}")
+            dit_entry = shards
+        else:
+            dit_entry = _abs(self.dit_path)
+        paths = [dit_entry, _abs(self.t5_path), _abs(self.vae_path)]
+        if self.image_encoder_path:
+            paths.append(_abs(self.image_encoder_path))
+        return paths
 
     def abs_tokenizer_path(self) -> str:
         return _abs(self.tokenizer_path)
@@ -101,6 +127,47 @@ REGISTRY: dict[str, WanBaseSpec] = {
         vace_layers=tuple(range(0, 30, 2)),       # 15 layers (same as VACE-1.3B)
         first_frame_mode="none",                  # T2V has no native first-frame path
         # vace_remove_prefix defaults to "pipe.vace." -> LoRA saves as vace_blocks.*
+    ),
+    # T4: Wan2.1-I2V-14B-480P. New variables vs T3 (master plan §4.2): SEAM-4 first-frame
+    # i2v_concat (input_image -> CLIP clip_feature + VAE-concat y, handled by the stock
+    # pipeline's image-embedder units, gated by require_clip/vae_embedding) + 14B scale.
+    # No native VACE branch -> SEAM-1 create_vace_from_dit (same as T3; full-param train,
+    # only after_proj zero-init). Official Wan2.1-VACE-14B is structurally isomorphic and
+    # can warm-start the from-DiT shell (optional; see provision strict-load path).
+    # DiT is 7 sharded safetensors -> dit_glob. CLIP encoder via image_encoder_path.
+    "wan2.1-i2v-14b-480p": WanBaseSpec(
+        name="wan2.1-i2v-14b-480p",
+        dit_path="",                              # unused; sharded -> dit_glob
+        dit_glob="models/Wan-AI/Wan2.1-I2V-14B-480P/diffusion_pytorch_model-*.safetensors",
+        vae_path=f"{_CONVERTED}/Wan2.1_VAE.safetensors",          # Wan2.1 VAE (z=16, s=8)
+        t5_path=f"{_CONVERTED}/models_t5_umt5-xxl-enc-bf16.safetensors",
+        tokenizer_path="models/Wan-AI/Wan2.1-T2V-1.3B/google/umt5-xxl",
+        image_encoder_path="models/Wan-AI/Wan2.1-I2V-14B-480P/models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth",
+        dim=5120, num_layers=40, num_heads=40, ffn_dim=13824,
+        vae_z_dim=16, vae_spatial_factor=8,       # vace_in_dim=96, mask_pq=8 (Wan2.1 VAE)
+        has_pretrained_vace=False,                # SEAM-1: create_vace_from_dit (warm-start optional)
+        vace_layers=tuple(range(0, 40, 5)),       # 8 layers: (0,5,10,15,20,25,30,35)
+        first_frame_mode="i2v_concat",            # SEAM-4: i2v first frame
+        # from-DiT vace MUST be trained full-param (T3 lesson); run script uses
+        # --trainable_models vace. vace_remove_prefix default "pipe.vace." -> vace_blocks.*
+    ),
+    # T5: Wan2.2-TI2V-5B. New variable vs T4 is SEAM-2: the Wan2.2 VAE has z=48 and
+    # 16x spatial compression, so vace_in_dim=2*48+16^2=352 and mask_pq=16. Its native
+    # first-frame mechanism is the fused TI2V path: `input_image` is encoded by the VAE
+    # and written into latent frame 0; FlowMatchSFTLoss then excludes that first latent
+    # from the training target. No pretrained VACE branch -> SEAM-1 create_vace_from_dit.
+    "wan2.2-ti2v-5b": WanBaseSpec(
+        name="wan2.2-ti2v-5b",
+        dit_path="",                              # robust to one-file vs sharded layout
+        dit_glob="models/Wan-AI/Wan2.2-TI2V-5B/diffusion_pytorch_model*.safetensors",
+        vae_path=f"{_CONVERTED}/Wan2.2_VAE.safetensors",          # Wan2.2 VAE (z=48, s=16)
+        t5_path=f"{_CONVERTED}/models_t5_umt5-xxl-enc-bf16.safetensors",
+        tokenizer_path="models/Wan-AI/Wan2.1-T2V-1.3B/google/umt5-xxl",
+        dim=3072, num_layers=30, num_heads=24, ffn_dim=14336,
+        vae_z_dim=48, vae_spatial_factor=16,      # vace_in_dim=352, mask_pq=16
+        has_pretrained_vace=False,                # SEAM-1: create_vace_from_dit
+        vace_layers=tuple(range(0, 30, 2)),       # 15 layers: (0,2,...,28)
+        first_frame_mode="ti2v_fused",            # SEAM-4: Wan2.2 fused first frame
     ),
 }
 

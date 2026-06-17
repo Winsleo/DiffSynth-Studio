@@ -66,17 +66,17 @@ def gate_shape(pipe, spec) -> None:
 
     vace = create_vace_from_dit(pipe, spec)
 
-    # shape derived from spec, never hardcoded
-    assert vace.vace_patch_embedding.in_channels == spec.vace_in_dim == 96, \
+    # shape derived from spec, never hardcoded (1.3B: 96/15/1536/8960; 14B: 96/8/5120/13824)
+    assert vace.vace_patch_embedding.in_channels == spec.vace_in_dim, \
         f"vace_in_dim {vace.vace_patch_embedding.in_channels} != {spec.vace_in_dim}"
-    assert len(vace.vace_blocks) == len(spec.vace_layers) == 15, \
+    assert len(vace.vace_blocks) == len(spec.vace_layers), \
         f"#vace_blocks {len(vace.vace_blocks)} != {len(spec.vace_layers)}"
     assert tuple(vace.vace_layers) == tuple(spec.vace_layers)
-    assert vace.vace_patch_embedding.out_channels == spec.dim == 1536
+    assert vace.vace_patch_embedding.out_channels == spec.dim
     # a representative block dim/ffn check
     b0 = vace.vace_blocks[0]
     assert b0.self_attn.q.weight.shape == (spec.dim, spec.dim)
-    assert b0.ffn[0].out_features == spec.ffn_dim == 8960
+    assert b0.ffn[0].out_features == spec.ffn_dim
     print(f"  shape ok: vace_in_dim={spec.vace_in_dim}, layers={tuple(vace.vace_layers)} "
           f"(={len(vace.vace_blocks)}), dim={spec.dim}, ffn={spec.ffn_dim}")
 
@@ -103,7 +103,7 @@ def gate_shape(pipe, spec) -> None:
     print("Gate (1) SHAPE: OK")
 
 
-def gate_zero_side_effect(pipe, spec, vace_video, args) -> None:
+def gate_zero_side_effect(pipe, spec, vace_video, first_frame, args) -> None:
     print("\n=== Gate (2): ZERO SIDE-EFFECT (real pipe(), with vs without control) ===")
     # provision the zero-init branch + the mask_pq unit (fresh; sets idempotency marker)
     provision_a2v(pipe, spec)
@@ -114,6 +114,12 @@ def gate_zero_side_effect(pipe, spec, vace_video, args) -> None:
         height=args.height, width=args.width, num_frames=args.num_frames,
         num_inference_steps=args.steps, cfg_scale=1.0, seed=args.seed, tiled=False,
     )
+    # SEAM-4: native first-frame bases require input_image in both runs. I2V builds
+    # CLIP/VAE-concat conditioning; TI2V writes the encoded first image into latent frame
+    # 0. The first frame is held FIXED (conditioning, not the control under test); only
+    # vace_video toggles. For non-native-first-frame bases no first frame is added here.
+    if spec.first_frame_mode in ("i2v_concat", "ti2v_fused"):
+        common["input_image"] = first_frame
 
     def _arr(frames):
         return np.stack([np.asarray(f.convert("RGB"), dtype=np.uint8) for f in frames])
@@ -177,10 +183,12 @@ def main() -> None:
     dataset = Path(args.dataset).resolve()
     row = json.loads((dataset / "metadata.jsonl").read_text().splitlines()[0])
     vace_video = _load_frames(dataset, row["vace_video"][: args.num_frames])
+    # first frame (= GT frame 0, dataset invariant I4) for the i2v_concat path
+    first_frame = _load_frames(dataset, [row["video"][0]])[0]
 
     pipe = _build_pipe(spec)
     gate_shape(pipe, spec)
-    gate_zero_side_effect(pipe, spec, vace_video, args)
+    gate_zero_side_effect(pipe, spec, vace_video, first_frame, args)
     if args.parity:
         gate_parity()
 

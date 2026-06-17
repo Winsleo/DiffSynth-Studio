@@ -103,6 +103,10 @@ def main() -> None:
     if args.remove_prefix_in_ckpt is None:
         args.remove_prefix_in_ckpt = "pipe.dit."  # stock default (non-spec usage)
 
+    height_division_factor = spec.vae_spatial_factor * spec.patch_size[1] if spec is not None else 16
+    width_division_factor = spec.vae_spatial_factor * spec.patch_size[2] if spec is not None else 16
+    time_division_factor = spec.vae_temporal_factor if spec is not None else 4
+
     accelerator = accelerate.Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         kwargs_handlers=[accelerate.DistributedDataParallelKwargs(find_unused_parameters=args.find_unused_parameters)],
@@ -119,10 +123,10 @@ def main() -> None:
             max_pixels=args.max_pixels,
             height=args.height,
             width=args.width,
-            height_division_factor=16,
-            width_division_factor=16,
+            height_division_factor=height_division_factor,
+            width_division_factor=width_division_factor,
             num_frames=args.num_frames,
-            time_division_factor=4 if not args.framewise_decoding else 1,
+            time_division_factor=time_division_factor if not args.framewise_decoding else 1,
             time_division_remainder=1 if not args.framewise_decoding else 0,
         ),
         special_operator_map={

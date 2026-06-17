@@ -1,142 +1,119 @@
-# A2V VACE Data Tools
+# A2V — Action-conditioned video on Wan (VACE)
 
-This package contains the low-intrusion A2V preparation path for Wan2.1 VACE.
-It renders ABot actions into 3-channel trajectory control videos, writes target
-and control frames as lossless PNG sequences, and emits JSONL metadata for
-the A2V training wrapper.
+Turn a robot end-effector trajectory into a **3-channel RGB trajectory map**, feed it as
+`vace_video` through the official **VACE** path, freeze the DiT and train only the VACE
+branch. One declarative `WanBaseSpec` per base model collapses the model differences, so
+the same prepare → train → infer → gate workflow runs across every Wan base.
 
-## Manifest
+All A2V code lives under `a2v/`; the upstream `diffsynth/` is never modified.
 
-Input manifest is JSONL or JSON. Each row needs:
+## Supported base models
 
-```json
-{
-  "id": "sample_0001",
-  "video": "/path/to/source.mp4",
-  "action_path": "/path/to/actions.h5",
-  "intrinsic_path": "/path/to/intrinsic.json",
-  "extrinsic_path": "/path/to/extrinsic.json",
-  "original_size": [480, 832],
-  "prompt": "robot arm action trajectory"
-}
-```
+| `--base_spec` | Track | VACE branch | first frame | optimizer | dataset / size |
+| --- | --- | --- | --- | --- | --- |
+| `wan2.1-vace-1.3b` | T1 | pretrained → LoRA | `vace_reference` | fp32 AdamW | `ep0_dataset_phys` 240×320 |
+| `wan2.1-t2v-1.3b` | T3 | from-DiT → full-param | `none`/reference | fp32 AdamW | `ep0_dataset_phys` 240×320 |
+| `wan2.1-i2v-14b-480p` | T4 | from-DiT → full-param | `i2v_concat` | 8-bit Adam | `ep0_dataset_phys` 240×320 |
+| `wan2.2-ti2v-5b` | T5 | from-DiT → full-param | `ti2v_fused` | 8-bit Adam | `ep0_dataset_phys_256x320` 256×320 |
 
-`action_path` supports ABot `.h5` files. For smoke/debugging it also supports
-`.npy` or `.npz` arrays with shape `[T, 16]` in:
+The three numbers that bite (derived from the spec, never hardcoded): `vace_in_dim =
+2·z_dim + spatial²` (96 for Wan2.1, **352** for Wan2.2), `mask_pq = spatial` (8 / **16**),
+and `vace_layers` given explicitly per depth. TI2V's Wan2.2 VAE is 16× spatial × patch 2 =
+32×, so its H,W must be divisible by 32 (hence 256×320, not 240×320).
 
-```text
-left_xyz(3), left_xyzw(4), left_gripper(1), right_xyz(3), right_xyzw(4), right_gripper(1)
-```
-
-Optional fields:
-
-- `frame_indices`: fixed list of frame ids. If present, it must have `num_frames` entries.
-- `start_frame`: deterministic window start when `frame_indices` is absent.
-- `total_frames`: skip video frame counting when known.
-
-## Prepare
-
-Use `crop` resize mode to match DiffSynth `ImageCropAndResize`.
+## 1. Prepare the dataset (once per episode)
 
 ```bash
-.venv/bin/python -m a2v.data.prepare \
-  --manifest /path/to/manifest.jsonl \
-  --output_dir data/a2v/my_dataset \
-  --height 480 \
-  --width 832 \
-  --num_frames 49 \
-  --resize_mode crop \
-  --write_overlay
+PY=.venv/bin/python
+# RoboTwin hdf5 -> actions/intrinsic/extrinsic.npy + manifest
+$PY -m a2v.data.robotwin_adapter \
+  --task beat_block_hammer --robot_mode aloha-agilex_clean_50 --episodes 0 \
+  --work_dir .cache/a2v_robotwin/ep0_work
+# render trajectory maps + lossless PNG frame lists + metadata.jsonl
+$PY -m a2v.data.prepare \
+  --manifest .cache/a2v_robotwin/ep0_work/manifest.jsonl \
+  --output_dir .cache/a2v_robotwin/ep0_dataset_phys \
+  --height 240 --width 320 --num_frames 121 \
+  --resize_mode stretch --gripper_z_offset 0 --radius_mode physical --write_overlay
 ```
 
-Output:
+`video` and `vace_video` are stored as same-indexed PNG lists so both routes see identical
+frames (the core A2V alignment invariant). For TI2V use `--height 256` and output dir
+`ep0_dataset_phys_256x320` (H,W must be /32).
 
-```text
-data/a2v/my_dataset/
-  metadata.jsonl
-  sample_0001/video/00000.png ...
-  sample_0001/vace_video/00000.png ...
-  sample_0001/reference/00000.png
-  sample_0001/overlay/00000.png ...
-```
-
-The output metadata stores `video` and `vace_video` as PNG frame-path lists, so
-both are fixed to the same frame indices before the DiffSynth dataset sees them.
-This is the key alignment invariant for VACE A2V training.
-
-## Rendering Notes
-
-Gripper colors follow ABot's `matplotlib.cm.Greens` and `matplotlib.cm.Reds`
-semantics. If `matplotlib` is not installed, A2V falls back to an internal
-ColorBrewer approximation so smoke tests remain runnable in minimal envs.
-
-Trajectory drawing uses PIL instead of ABot's cv2 backend. This keeps the first
-stage dependency-light, but there can be tiny anti-aliasing or line-width
-differences. For strict pixel-level warm-start matching against an ABot
-checkpoint, switch the drawing backend to cv2.
-
-## Validate
+Validate / synthetic smoke (no weights needed):
 
 ```bash
-.venv/bin/python -m a2v.data.validate \
-  --dataset_base_path data/a2v/my_dataset \
-  --dataset_metadata_path data/a2v/my_dataset/metadata.jsonl \
-  --height 480 \
-  --width 832 \
-  --num_frames 49
+$PY -m a2v.data.validate --base_spec wan2.2-ti2v-5b \
+  --dataset_base_path .cache/a2v_robotwin/ep0_dataset_phys_256x320 \
+  --dataset_metadata_path .cache/a2v_robotwin/ep0_dataset_phys_256x320/metadata.jsonl \
+  --height 256 --width 320 --num_frames 121
+$PY -m a2v.data.smoke
 ```
 
-## Smoke Test
+## 2. Train (single-sample overfit gate)
 
-No real data or model weights are required:
+One script, any base — presets (dataset, resolution, lr, optimizer, first-frame, LoRA vs
+full-param) are chosen from the spec:
 
 ```bash
-.venv/bin/python -m a2v.data.smoke
+bash a2v/run_overfit.sh wan2.2-ti2v-5b
+# override any preset via env: LR=1e-5 OUT=... HEIGHT=256 bash a2v/run_overfit.sh <spec>
 ```
 
-## Master Plan Status
+Checkpoints land in `models/train/.../step-*.safetensors` (LoRA for vace-1.3b, full vace
+state dict otherwise).
 
-Current status against `A2V_master_plan.md`:
-
-- T1 render/data/overlay/synthetic dataset smoke: implemented and verified.
-- T1 real-data overlay gate, official baseline, LoRA overfit, full VACE train, ablations, and inference harness: still pending.
-- `metadata.jsonl` is used instead of CSV because frame-path lists must remain structured.
-- A2V frame-list loading is kept in `a2v.data.frame_list_video_operator()` to avoid modifying DiffSynth core data flow.
-
-## Training Wiring Dependencies
-
-Stock DiffSynth `UnifiedDataset.default_video_operator()` accepts video paths
-for the video route, not JSONL frame-path lists. When training from the PNG lists
-produced here, inject `a2v.data.operators.frame_list_video_operator` into the
-training dataset construction. Do not add list handling to DiffSynth core data
-flow for A2V.
-
-`vace_reference_image` is the target video's first frame, aligned with
-`video[0]` and `vace_video[0]`. This follows official VACE usage: the pipeline
-adds the reference as an extra latent frame in front. Do not insert an additional
-first frame into `vace_video`.
-
-## Train With Wan VACE LoRA
-
-The strict master-plan path is to use an A2V training wrapper that passes `a2v.data.frame_list_video_operator()` explicitly. The stock script command below is retained as a reference for model/training flags; it should be wired through `a2v/train_a2v.py` before running on JSONL frame lists.
+## 3. Infer + causal gate
 
 ```bash
-accelerate launch examples/wanvideo/model_training/train.py \
-  --dataset_base_path data/a2v/my_dataset \
-  --dataset_metadata_path data/a2v/my_dataset/metadata.jsonl \
-  --data_file_keys "video,vace_video,vace_reference_image" \
-  --height 480 \
-  --width 832 \
-  --num_frames 49 \
-  --dataset_repeat 100 \
-  --model_id_with_origin_paths "Wan-AI/Wan2.1-VACE-1.3B:diffusion_pytorch_model*.safetensors,Wan-AI/Wan2.1-VACE-1.3B:models_t5_umt5-xxl-enc-bf16.pth,Wan-AI/Wan2.1-VACE-1.3B:Wan2.1_VAE.pth" \
-  --learning_rate 1e-4 \
-  --num_epochs 5 \
-  --remove_prefix_in_ckpt "pipe.vace." \
-  --output_path "./models/train/Wan2.1-VACE-1.3B_a2v_lora" \
-  --lora_base_model "vace" \
-  --lora_target_modules "q,k,v,o,ffn.0,ffn.2" \
-  --lora_rank 32 \
-  --extra_inputs "vace_video,vace_reference_image" \
-  --use_gradient_checkpointing_offload
+# generate under real control and a negative control (none = blank, shuffle = reversed)
+for c in real none; do $PY -m a2v.infer_a2v --base_spec wan2.2-ti2v-5b \
+  --dataset .cache/a2v_robotwin/ep0_dataset_phys_256x320 \
+  --lora models/train/a2v_robotwin_ep0_vace_ti2v/step-1000.safetensors \
+  --height 256 --width 320 --num_frames 121 --control $c \
+  --output .cache/a2v_robotwin/gen_$c.mp4; done
+
+# metrics auto-derive H,W from the GT frames — no --height needed
+$PY -m a2v.causal_metrics --dataset .cache/a2v_robotwin/ep0_dataset_phys_256x320 \
+  --real .cache/a2v_robotwin/gen_real.mp4 --none .cache/a2v_robotwin/gen_none.mp4
 ```
+
+**Gate passes** when REAL reconstructs the GT trajectory (low MAE-GT, motion ≈ GT) and is
+clearly closer to GT than the negative control. For i2v/ti2v bases the negative control is
+not expected to be static (they freely animate from frame 0); the signal is `REAL ≪ NONE`
+on MAE-GT plus a non-trivial real-vs-none difference.
+
+## 4. Pre-flight / provision checks
+
+```bash
+$PY -m a2v.check_load          --base_spec wan2.2-ti2v-5b   # loads + builds VACE branch
+$PY -m a2v.check_t3_provision  --base_spec wan2.2-ti2v-5b \
+  --dataset .cache/a2v_robotwin/ep0_dataset_phys_256x320 --height 256 --width 320
+$PY -m a2v.check_t2_parity                                  # VACE-1.3B abstraction parity
+$PY -m a2v.render.check_projection                          # intrinsic-scaling regression
+```
+
+`check_load` confirms the DiT/VAE/CLIP load and the from-DiT VACE branch builds (shapes,
+zero-init, mask_pq). `check_t3_provision` adds the zero-side-effect gate (a real `pipe()`
+with vs without control is bit-identical at init).
+
+## Layout
+
+```
+a2v/
+  base_spec.py        WanBaseSpec + REGISTRY (one entry per base model)
+  provision.py        SEAM-1: create_vace_from_dit / ensure_vace / provision_a2v
+  vace_unit.py        SEAM-2: mask_pq-parameterized VACE unit (no diffsynth edit)
+  train_a2v.py        thin trainer wrapper (frame-list operator + from-DiT vace build)
+  infer_a2v.py        inference + causal-control harness
+  causal_metrics.py   MAE-GT / motion / real-vs-none gate metrics
+  run_overfit.sh      unified single-sample overfit (takes <base_spec>)
+  check_load.py       load smoke (any base)
+  check_t3_provision.py / check_t2_parity.py   provision / abstraction gates
+  data/               robotwin_adapter, prepare, operators, validate, smoke
+  render/             traj_map, action_io, check_projection
+  A2V_HANDOFF.md      project handoff / status (read this for full history)
+```
+
+See `A2V_HANDOFF.md` for the full per-track status, decisions, and lessons.

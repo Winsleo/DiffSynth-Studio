@@ -8,6 +8,7 @@ from pathlib import Path
 
 from diffsynth.core import UnifiedDataset
 
+from a2v.base_spec import get_spec
 from a2v.data.operators import frame_list_video_operator
 
 
@@ -18,6 +19,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--height", type=int, required=True)
     parser.add_argument("--width", type=int, required=True)
     parser.add_argument("--num_frames", type=int, required=True)
+    parser.add_argument("--base_spec", default=None, help="Optional WanBaseSpec name; derives spatial/time divisibility factors.")
     parser.add_argument("--max_items", type=int, default=10)
     return parser.parse_args()
 
@@ -28,6 +30,10 @@ def image_size(image) -> tuple[int, int]:
 
 def main() -> None:
     args = parse_args()
+    spec = get_spec(args.base_spec) if args.base_spec else None
+    height_division_factor = spec.vae_spatial_factor * spec.patch_size[1] if spec is not None else 16
+    width_division_factor = spec.vae_spatial_factor * spec.patch_size[2] if spec is not None else 16
+    time_division_factor = spec.vae_temporal_factor if spec is not None else 4
     dataset = UnifiedDataset(
         base_path=args.dataset_base_path,
         metadata_path=args.dataset_metadata_path,
@@ -38,10 +44,10 @@ def main() -> None:
             max_pixels=None,
             height=args.height,
             width=args.width,
-            height_division_factor=16,
-            width_division_factor=16,
+            height_division_factor=height_division_factor,
+            width_division_factor=width_division_factor,
             num_frames=args.num_frames,
-            time_division_factor=4,
+            time_division_factor=time_division_factor,
             time_division_remainder=1,
         ),
     )

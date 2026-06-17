@@ -133,16 +133,29 @@ def main() -> None:
     vace = provision_a2v(pipe, spec)
     _load_vace_weights(pipe, vace, args.lora, args.lora_alpha)
 
+    # SEAM-4 first frame: route `ref` (= GT frame 0, dataset invariant I4) by base mode.
+    #   * i2v_concat (I2V-14B, T4): `input_image` builds CLIP + VAE concat conditioning.
+    #   * ti2v_fused (TI2V-5B, T5): `input_image` is VAE-encoded into latent frame 0.
+    #   * vace_reference / legacy none: keep the prior VACE reference path.
+    # These are alternatives, not additive: native first-frame paths already inject frame 0,
+    # so we do NOT also pass vace_reference_image there. The causal control (real vs none)
+    # still lives entirely in vace_video.
+    frame_kwargs: dict = {}
+    if spec.first_frame_mode in ("i2v_concat", "ti2v_fused"):
+        frame_kwargs["input_image"] = ref
+    else:
+        frame_kwargs["vace_reference_image"] = ref
+
     video = pipe(
         prompt=row.get("prompt", "robot arm manipulation"),
         negative_prompt=NEG_PROMPT,
         vace_video=vace_video,
-        vace_reference_image=ref,
         height=args.height,
         width=args.width,
         num_frames=args.num_frames,
         seed=args.seed,
         tiled=False,
+        **frame_kwargs,
     )
     out = Path(args.output)
     out.parent.mkdir(parents=True, exist_ok=True)
