@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Track T3 exit gates — SEAM-1 "create VACE from DiT" for a base without a VACE branch.
+"""Provision gates — SEAM-1 "create VACE from DiT" for any base without a VACE branch
+(T2V-1.3B / I2V-14B / TI2V-5B; select with --base_spec).
 
-T2V-1.3B ships no VACE weights, so `provision.create_vace_from_dit` clones the matching
-DiT blocks and zero-inits the VACE-only projections. This script proves the two gates
-that must hold before any overfit run is meaningful:
+A from-DiT base ships no VACE weights, so `provision.create_vace_from_dit` clones the
+matching DiT blocks and zero-inits the VACE-only projections. This script proves the two
+gates that must hold before any overfit run is meaningful:
 
   Gate (1) SHAPE   — the built branch has the spec-derived shape (vace_in_dim=96, 15
                      layers at vace_layers, dims from DiT) and the DiT-block weights
@@ -22,7 +23,7 @@ that must hold before any overfit run is meaningful:
                      Uses VACE-1.3B (not T2V) so it does not depend on T2V==VACE bytes.
 
 Run:
-    .venv/bin/python -m a2v.check_t3_provision \
+    .venv/bin/python -m a2v.check_provision --base_spec wan2.1-t2v-1.3b \
         --dataset .cache/a2v_robotwin/ep0_dataset_phys [--parity]
 """
 
@@ -166,7 +167,7 @@ def gate_parity() -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--base_spec", default="wan2.1-t2v-1.3b")
+    parser.add_argument("--base_spec", required=True, help="WanBaseSpec name (a2v.base_spec.REGISTRY).")
     parser.add_argument("--dataset", default=".cache/a2v_robotwin/ep0_dataset_phys")
     parser.add_argument("--num_frames", type=int, default=13)   # 4n+1, small for speed
     parser.add_argument("--height", type=int, default=240)
@@ -178,7 +179,7 @@ def main() -> None:
 
     spec = get_spec(args.base_spec)
     assert not spec.has_pretrained_vace, \
-        f"{spec.name} has a pretrained VACE; T3 gates are for the from-DiT path."
+        f"{spec.name} has a pretrained VACE; provision gates are for the from-DiT path."
 
     dataset = Path(args.dataset).resolve()
     row = json.loads((dataset / "metadata.jsonl").read_text().splitlines()[0])
@@ -192,7 +193,7 @@ def main() -> None:
     if args.parity:
         gate_parity()
 
-    print("\nT3 provision gates: OK")
+    print(f"\nprovision gates ({spec.name}): OK")
 
 
 if __name__ == "__main__":

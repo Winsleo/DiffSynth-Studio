@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Track T2 对拍 gate — prove the abstraction is a zero behavioral change for VACE-1.3B.
+"""Abstraction parity gate — prove the WanBaseSpec / parameterized-vace_unit abstraction
+is a zero behavioral change for the pretrained-VACE base (VACE-1.3B).
 
 Two seams could in principle alter behavior:
   * SEAM-1 (ensure_vace): must return the *same* pretrained VACE module object.
@@ -13,7 +14,7 @@ each unit — match, and the only thing under test is the mask path). Bit-identi
 + `ensure_vace is pipe.vace` ⇒ the whole forward is unchanged ⇒ any future seam bug (T3/T5) is
 isolated to the abstraction layer.
 
-Run: .venv/bin/python -m a2v.check_t2_parity [--dataset .cache/a2v_robotwin/ep0_dataset]
+Run: .venv/bin/python -m a2v.check_parity [--dataset .cache/a2v_robotwin/ep0_dataset]
 """
 
 from __future__ import annotations

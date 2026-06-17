@@ -88,14 +88,14 @@ on MAE-GT plus a non-trivial real-vs-none difference.
 
 ```bash
 $PY -m a2v.check_load          --base_spec wan2.2-ti2v-5b   # loads + builds VACE branch
-$PY -m a2v.check_t3_provision  --base_spec wan2.2-ti2v-5b \
+$PY -m a2v.check_provision  --base_spec wan2.2-ti2v-5b \
   --dataset .cache/a2v_robotwin/ep0_dataset_phys_256x320 --height 256 --width 320
-$PY -m a2v.check_t2_parity                                  # VACE-1.3B abstraction parity
+$PY -m a2v.check_parity                                  # VACE-1.3B abstraction parity
 $PY -m a2v.render.check_projection                          # intrinsic-scaling regression
 ```
 
 `check_load` confirms the DiT/VAE/CLIP load and the from-DiT VACE branch builds (shapes,
-zero-init, mask_pq). `check_t3_provision` adds the zero-side-effect gate (a real `pipe()`
+zero-init, mask_pq). `check_provision` adds the zero-side-effect gate (a real `pipe()`
 with vs without control is bit-identical at init).
 
 ## Layout
@@ -110,7 +110,7 @@ a2v/
   causal_metrics.py   MAE-GT / motion / real-vs-none gate metrics
   run_overfit.sh      unified single-sample overfit (takes <base_spec>)
   check_load.py       load smoke (any base)
-  check_t3_provision.py / check_t2_parity.py   provision / abstraction gates
+  check_provision.py / check_parity.py   provision / abstraction gates
   data/               robotwin_adapter, prepare, operators, validate, smoke
   render/             traj_map, action_io, check_projection
   A2V_HANDOFF.md      project handoff / status (read this for full history)

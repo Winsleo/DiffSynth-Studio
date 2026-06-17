@@ -13,7 +13,7 @@ SEAM-1 has two cases:
 
 For Wan2.1-VACE-1.3B both `provision_a2v` and `ensure_vace` are no-ops vs the stock
 T1 path (pretrained vace already loaded; mask_pq=8 == the hardcoded value) — which
-`a2v/check_t2_parity.py` proves.
+`a2v/check_parity.py` proves.
 """
 
 from __future__ import annotations

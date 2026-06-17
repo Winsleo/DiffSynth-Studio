@@ -8,7 +8,7 @@ original file, by subclassing and replacing the unit instance in `pipe.units`.
 
 `process` below is a verbatim copy of the stock body; the SOLE change is
 `P=8, Q=8` -> `P=self.mask_pq, Q=self.mask_pq`. At `mask_pq=8` it is provably identical to
-stock (proven by `a2v/check_t2_parity.py`).
+stock (proven by `a2v/check_parity.py`).
 """
 
 from __future__ import annotations

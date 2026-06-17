@@ -33,7 +33,7 @@
 > cd /vepfs/wangshilong/code/DiffSynth-Studio
 > PY=.venv/bin/python
 > $PY -m a2v.check_load --base_spec wan2.2-ti2v-5b
-> $PY -m a2v.check_t3_provision --base_spec wan2.2-ti2v-5b \
+> $PY -m a2v.check_provision --base_spec wan2.2-ti2v-5b \
 >   --dataset .cache/a2v_robotwin/ep0_dataset_phys_256x320 --height 256 --width 320 --num_frames 13 --steps 4
 > CUDA_VISIBLE_DEVICES=<g> bash a2v/run_overfit.sh wan2.2-ti2v-5b
 > for c in real none shuffle; do $PY -m a2v.infer_a2v --base_spec wan2.2-ti2v-5b \
@@ -184,14 +184,14 @@ P=Q **必须等于 VAE 空间压缩因子**（否则崩）——这是 master pl
 | `base_spec.py` | **[T2/T3/T4/T5]** `WanBaseSpec`+`REGISTRY`+`get_spec`；含 `wan2.2-ti2v-5b`(352/16,§14) |
 | `vace_unit.py` | **[T2]** `ParamWanVideoUnit_VACE`(参数化 mask_pq)+`install_vace_unit`(§8) |
 | `provision.py` | **[T2/T3]** `ensure_vace`(SEAM-1,幂等)+`provision_a2v`+`create_vace_from_dit`(从 DiT 造 VACE,只 zero-init after_proj,§11) |
-| `check_t3_provision.py` | **[T3/T4/T5]** SEAM-1 退出门:形状/零副作用/结构 parity(§11);I2V/TI2V 传 `input_image`(§12/§14) |
+| `check_provision.py` | **[T3/T4/T5]** SEAM-1 退出门:形状/零副作用/结构 parity(§11);I2V/TI2V 传 `input_image`(§12/§14) |
 | `run_overfit.sh` | **[统一,06-17]** `bash a2v/run_overfit.sh <base_spec>` 单样本过拟合,按 spec 自带预设(lr/数据集/H×W/优化器/首帧/LoRA-vs-全参)。取代 run_overfit_{t2v,i2v,ti2v}.sh |
 | `check_load.py` | **[统一,06-17]** `--base_spec` 加载冒烟(取代 check_t4_load/check_t5_load):DiT层数/VAE z·s/造 vace(in_dim·层数·after_proj=0)/mask_pq;i2v 验 CLIP+in_dim36,ti2v 验 in_dim48+fused |
 | `causal_metrics.py` | **[可复用]** 因果门度量 MAE-GT/motion/real-vs-none;H,W 默认从 GT PNG 自动派生(§12) |
 | `train_a2v.py` | **[T1/T2/T5]** 薄训练封装(swap operator)+`--base_spec`+`provision_a2v`；按 spec 派生数据整除因子 |
 | `infer_a2v.py` | **[T1/T2/T4/T5]** 推理 harness;`--base_spec`/`--control real\|none\|shuffle`；I2V/TI2V 首帧走 `input_image` |
 | `run_overfit.sh` | **[T1/T2]** 单样本 LoRA 过拟合(spec 驱动) |
-| `check_t2_parity.py` | **[T2]** 零行为变更对拍闸门(§8) |
+| `check_parity.py` | **[T2]** 零行为变更对拍闸门(§8) |
 | `README_A2V.md` | 用法 + 训练接线前向依赖 + reference 帧语义 |
 
 ---
@@ -218,7 +218,7 @@ P=Q **必须等于 VAE 空间压缩因子**（否则崩）——这是 master pl
 cd /vepfs/wangshilong/code/DiffSynth-Studio
 .venv/bin/python -m a2v.render.check_projection   # check_projection: OK
 .venv/bin/python -m a2v.data.smoke                # same_size/scaled_crop 通过 + bad_original_size 期望失败
-.venv/bin/python -m a2v.check_t2_parity           # T2 parity: OK (需 GPU,加载 VACE-1.3B)
+.venv/bin/python -m a2v.check_parity           # T2 parity: OK (需 GPU,加载 VACE-1.3B)
 ```
 
 **新半径可用产物（06-13 验证，直接可用，无需任何手工后处理）：**
@@ -340,9 +340,9 @@ $PY -m a2v.infer_a2v --dataset .cache/a2v_robotwin/ep0_dataset \
   `install_vace_unit(pipe, mask_pq)`(在 `pipe.units` 里就地替换那个 VACE 单元)。**不改 `diffsynth/`**。
 - `provision.py`：`ensure_vace(pipe, spec)`(SEAM-1；有权重→返回 `pipe.vace`) + `provision_a2v`。
   （此处为 T2 当时状态；**无权重分支已在 T3 实现为 `create_vace_from_dit`,且 ensure_vace 已幂等化 —— 见 §11**。）
-- `check_t2_parity.py`：**T2 对拍闸门**。
+- `check_parity.py`：**T2 对拍闸门**。
 
-**对拍闸门结果（`python -m a2v.check_t2_parity`）：**
+**对拍闸门结果（`python -m a2v.check_parity`）：**
 - SEAM-1：`ensure_vace(pipe, spec) is pipe.vace` ✓
 - SEAM-2：固定同 seed 下 stock 与 param(mask_pq=8) 的 `vace_context`（shape `(1,96,32,30,40)`）**bit-identical, max_abs_diff=0** ✓
 - 端到端：spec 驱动 infer(`--base_spec`) 复用 T1 的 step-1000 LoRA，输出与 T1 硬编码路径 **MD5 完全一致**（逐帧 Δ=0）。
@@ -437,7 +437,7 @@ key-set 与已知可用旧 LoRA 命名空间逐一致 ⇒ **重训原生产出�
   **只 zero-init `after_proj`**）；`ensure_vace` 幂等化（无 vace→造一次并打标记，避免二次覆盖）。
 - `train_a2v.py`：`A2VWanTrainingModule` 子类，在 `switch_pipe_to_training_mode` 前 `ensure_vace`，使 from-DiT 分支
   在 freeze/挂训前就存在（否则 stock 在 `pipe.vace is None` 时静默跳过）。T2 路径幂等无变化。
-- `check_t3_provision.py`：3 道门 —— ①形状(96/15层/拷贝核对) ②**零副作用**(真 `pipe()` 带控制 vs 不带控制逐位相同) ③(可选`--parity`)
+- `check_provision.py`：3 道门 —— ①形状(96/15层/拷贝核对) ②**零副作用**(真 `pipe()` 带控制 vs 不带控制逐位相同) ③(可选`--parity`)
   用 VACE-1.3B 自己的 DiT 造壳后 `load_state_dict(官方vace,strict)` 全等。**全绿。**
 - `run_overfit_t2v.sh`：T3 **全参** vace 过拟合（`--trainable_models vace`，非 LoRA，见下纠错）；`run_overfit.sh` 参数化(SPEC/DATASET/OUT)。
 - `infer_a2v.py`：`_load_vace_weights` 自动辨识 LoRA(含`lora_`键)→`load_lora` / 全参 vace→`load_state_dict`。
@@ -467,7 +467,7 @@ key-set 与已知可用旧 LoRA 命名空间逐一致 ⇒ **重训原生产出�
 **复现命令：**
 ```bash
 PY=.venv/bin/python
-$PY -m a2v.check_t3_provision --dataset .cache/a2v_robotwin/ep0_dataset_phys --parity   # 三门全绿
+$PY -m a2v.check_provision --dataset .cache/a2v_robotwin/ep0_dataset_phys --parity   # 三门全绿
 bash a2v/run_overfit_t2v.sh                                                              # 全参 1000 步
 for c in real none; do $PY -m a2v.infer_a2v --base_spec wan2.1-t2v-1.3b \
   --dataset .cache/a2v_robotwin/ep0_dataset_phys \
@@ -500,7 +500,7 @@ for c in real none; do $PY -m a2v.infer_a2v --base_spec wan2.1-t2v-1.3b \
   （dim 5120/40层/40头/ffn 13824、`vace_layers=(0,5,…,35)=8`、`has_pretrained_vace=False`、`first_frame_mode="i2v_concat"`）。
 - `infer_a2v.py`：按 `spec.first_frame_mode` 路由首帧 —— **i2v_concat → `input_image`（不传 vace_reference_image，二者是替代非叠加）**；
   其余基模仍走 vace_reference。
-- `check_t3_provision.py`：gate_shape 去掉硬编码的 1.3B 数字（改 spec 驱动）；**gate_zero_side_effect 对 i2v 必须传 `input_image`**
+- `check_provision.py`：gate_shape 去掉硬编码的 1.3B 数字（改 spec 驱动）；**gate_zero_side_effect 对 i2v 必须传 `input_image`**
   （I2V DiT in_dim=36，无首帧则 16ch latent 进不了 36ch patch_embedding 会崩）。
 - `run_overfit_i2v.sh`（**新**）：T4 全参 vace 过拟合配方。
 - `check_t4_load.py`（**新**）：14B 本地加载冒烟（7分片合并 / CLIP .pth 直载 / in_dim=36 / create_vace_from_dit 造 8 层）。
@@ -511,7 +511,7 @@ for c in real none; do $PY -m a2v.infer_a2v --base_spec wan2.1-t2v-1.3b \
 - **加载**：`check_t4_load` 全绿 —— 7 分片自动合并成 40-block DiT；**CLIP `.pth` 直接加载成 `WanImageEncoder`（无需转 safetensors）**；
   in_dim=36 / has_image_input / require_clip / require_vae 全 True；create_vace_from_dit 造出 8 层 vace（vace_in_dim=96）、after_proj=0、
   patch_embedding 存活(0.051)。
-- **provision 两门**（`check_t3_provision --base_spec wan2.1-i2v-14b-480p`）：①形状 96/8层/5120/13824、权重拷贝、after_proj=0 ✓
+- **provision 两门**（`check_provision --base_spec wan2.1-i2v-14b-480p`）：①形状 96/8层/5120/13824、权重拷贝、after_proj=0 ✓
   ②**零副作用**：真 `pipe()` 带 `input_image`、切换 vace 控制 → 逐位相同 max_abs=0 ✓。
 - **SEAM-4 训练自动取首帧**：stock `parse_extra_inputs` 把 `input_image → data["video"][0]`（GT 首帧），故训练只需
   `--extra_inputs vace_video,input_image` + `--data_file_keys video,vace_video`，**不用改 train_a2v.py**。
@@ -559,7 +559,7 @@ cross-attn → VACE-14B **不能 strict-load** 进 I2V shell，只能非严格�
 ```bash
 PY=.venv/bin/python
 $PY -m a2v.check_t4_load                                                         # 加载冒烟全绿
-$PY -m a2v.check_t3_provision --base_spec wan2.1-i2v-14b-480p \
+$PY -m a2v.check_provision --base_spec wan2.1-i2v-14b-480p \
    --dataset .cache/a2v_robotwin/ep0_dataset_phys                               # provision 两门绿
 # 历史失败复现（旧 lr=1e-4 目录勿用）；当前 run_overfit_i2v.sh 默认 lr=1e-5，会复现 §13.4 的 PASS：
 bash a2v/run_overfit_i2v.sh
@@ -653,7 +653,7 @@ real/none/shuffle 因果门均通过。
 ### 14.1 代码改动
 - `base_spec.py`：新增 `wan2.2-ti2v-5b`。DiT 3 分片，Wan2.2 converted VAE，复用 umt5 encoder/tokenizer；30 层、dim 3072、heads 24、ffn 14336；`vace_layers=(0,2,...,28)`；`first_frame_mode="ti2v_fused"`。
 - `train_a2v.py`：dataset operator 的空间/时间整除因子改为按 spec 派生。T5 因 `vae_spatial_factor=16` 且 patch size=2，训练数据需 H/W 可被 32 整除。
-- `infer_a2v.py` / `check_t3_provision.py`：`ti2v_fused` 与 `i2v_concat` 一样走 `input_image`，不走 `vace_reference_image`。
+- `infer_a2v.py` / `check_provision.py`：`ti2v_fused` 与 `i2v_concat` 一样走 `input_image`，不走 `vace_reference_image`。
 - `data/validate.py`：新增 `--base_spec`，按 spec 校验空间/时间整除。
 - `check_t5_load.py`：TI2V-5B 加载冒烟与 VACE 壳检查。
 - `run_overfit_ti2v.sh`：T5 单样本全参 vace 过拟合配方，默认 `LR=1e-5`、`HEIGHT=256`、`WIDTH=320`、`FRAMES=121`。
@@ -666,7 +666,7 @@ real/none/shuffle 因果门均通过。
 
 ### 14.3 退出门结果
 - `check_t5_load`：DiT 30 blocks、`in_dim=48`、fused VAE latent=True、separated timestep=True；WanVideoVAE38 `z_dim=48`、upsampling=16；`create_vace_from_dit` 造 15 层 VACE，`vace_in_dim=352`，`after_proj` 全零，`patch_embedding` 存活；`ParamWanVideoUnit_VACE(mask_pq=16)` 安装成功。
-- `check_t3_provision --base_spec wan2.2-ti2v-5b`：形状门 352/15 层/3072/14336 通过；权重拷贝通过；零副作用门 `max_abs_pixel_diff=0`、`bit_identical=True`。
+- `check_provision --base_spec wan2.2-ti2v-5b`：形状门 352/15 层/3072/14336 通过；权重拷贝通过；零副作用门 `max_abs_pixel_diff=0`、`bit_identical=True`。
 - 训练：`CUDA_VISIBLE_DEVICES=0 bash a2v/run_overfit_ti2v.sh` 完成 1000 steps，约 3.1s/it，峰值约 39GB，ckpt 在 `models/train/a2v_robotwin_ep0_vace_ti2v/step-{100..1000}.safetensors`。
 - 推理：`step-1000.safetensors` 全参 vace 439 keys，加载 `missing=0 unexpected=0`。
 
@@ -698,7 +698,7 @@ $PY -m a2v.data.validate --base_spec wan2.2-ti2v-5b \
   --height 256 --width 320 --num_frames 121
 
 $PY -m a2v.check_t5_load
-$PY -m a2v.check_t3_provision --base_spec wan2.2-ti2v-5b \
+$PY -m a2v.check_provision --base_spec wan2.2-ti2v-5b \
   --dataset .cache/a2v_robotwin/ep0_dataset_phys_256x320 \
   --height 256 --width 320 --num_frames 13 --steps 4
 
@@ -726,7 +726,7 @@ $PY -m a2v.causal_metrics --dataset .cache/a2v_robotwin/ep0_dataset_phys_256x320
 
 ### 14.8 本轮最终复查上下文
 - 环境：已卸载 deepspeed；`.venv/bin/python -m pip show deepspeed` 返回 package not found；`from diffsynth.core.gradient.gradient_checkpoint import _HAS_DEEPSPEED` 输出 `False`。常规 a2v 命令不再需要 `CUDA_HOME=a2v/.fakecuda`。
-- 静态验证：`.venv/bin/python -m py_compile a2v/base_spec.py a2v/train_a2v.py a2v/infer_a2v.py a2v/check_t3_provision.py a2v/check_t5_load.py a2v/data/validate.py` 通过；`bash -n a2v/run_overfit_i2v.sh` 和 `bash -n a2v/run_overfit_ti2v.sh` 通过。
+- 静态验证：`.venv/bin/python -m py_compile a2v/base_spec.py a2v/train_a2v.py a2v/infer_a2v.py a2v/check_provision.py a2v/check_t5_load.py a2v/data/validate.py` 通过；`bash -n a2v/run_overfit_i2v.sh` 和 `bash -n a2v/run_overfit_ti2v.sh` 通过。
 - 资源：`nvidia-smi --query-gpu=index,name,memory.used,memory.total --format=csv,noheader` 显示 8 张 A100-SXM4-80GB 均约 4 MiB 占用，训练/推理进程已结束。
 - 自动记忆：`find /vepfs/wangshilong/code -maxdepth 5 -type f \( -name 'MEMORY.md' -o -name 'a2v-robotwin-convention.md' \)` 未找到文件；只找到本文 `a2v/A2V_HANDOFF.md`。若后续会话需要“记忆同步”，先确认这些文件是否在别的路径或由外部系统托管。
 - 工作区：本轮代码和文档仍未提交；`a2v/A2V_HANDOFF.md`、`check_t5_load.py`、`run_overfit_ti2v.sh`、`causal_metrics.py` 等为当前工作区产物。继续前先看 `git status --short`，不要误删未跟踪文件。
