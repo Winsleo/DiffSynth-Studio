@@ -113,7 +113,9 @@ a2v/
   check_provision.py / check_parity.py   provision / abstraction gates
   data/               robotwin_adapter, prepare, operators, validate, smoke
   render/             traj_map, action_io, check_projection
-  A2V_HANDOFF.md      project handoff / status (read this for full history)
+  A2V_HANDOFF.md      project handoff: current status + checklist + quick reference
+  A2V_HISTORY.md      per-track debugging history, fixes, and lessons (appendix)
 ```
 
-See `A2V_HANDOFF.md` for the full per-track status, decisions, and lessons.
+See `A2V_HANDOFF.md` for current status and the handoff checklist; `A2V_HISTORY.md` for the
+full per-track history, decisions, and lessons.
