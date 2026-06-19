@@ -94,6 +94,63 @@ def load_frames(dataset: Path, rel_paths: list[str]) -> list[Image.Image]:
     return [Image.open(dataset / p).convert("RGB") for p in rel_paths]
 
 
+def build_pipe_with_vace(base_spec: str, ckpt_path: str, lora_alpha: float = 1.0):
+    """Build a WanVideoPipeline, provision A2V seams, and load trained VACE weights."""
+    spec = get_spec(base_spec)
+    pipe = WanVideoPipeline.from_pretrained(
+        torch_dtype=torch.bfloat16,
+        device="cuda",
+        model_configs=[ModelConfig(path=p) for p in spec.model_paths()],
+        tokenizer_config=ModelConfig(spec.abs_tokenizer_path()),
+    )
+    vace = provision_a2v(pipe, spec)
+    _load_vace_weights(pipe, vace, ckpt_path, lora_alpha)
+    return pipe, spec
+
+
+def _control_vace_video(vace_video: list[Image.Image], control: str, width: int, height: int) -> list[Image.Image]:
+    if control == "real":
+        return vace_video
+    if control == "none":
+        return [Image.new("RGB", (width, height), (128, 128, 128)) for _ in vace_video]
+    if control == "shuffle":
+        idx = list(range(len(vace_video)))[::-1]
+        return [vace_video[i] for i in idx]
+    raise ValueError(f"unknown control: {control}")
+
+
+def first_frame_kwargs(spec, ref: Image.Image) -> dict:
+    # SEAM-4 first frame: route `ref` (= GT frame 0, dataset invariant I4) by base mode.
+    #   * i2v_concat (I2V-14B, T4): `input_image` builds CLIP + VAE concat conditioning.
+    #   * ti2v_fused (TI2V-5B, T5): `input_image` is VAE-encoded into latent frame 0.
+    #   * vace_reference / legacy none: keep the prior VACE reference path.
+    # These are alternatives, not additive: native first-frame paths already inject frame 0,
+    # so we do NOT also pass vace_reference_image there. The causal control (real vs none)
+    # still lives entirely in vace_video.
+    if spec.first_frame_mode in ("i2v_concat", "ti2v_fused"):
+        return {"input_image": ref}
+    return {"vace_reference_image": ref}
+
+
+def generate_one(pipe, spec, row: dict, dataset: Path, control: str, height: int, width: int,
+                 num_frames: int, seed: int):
+    """Generate one dataset row and return the pipeline video frames."""
+    vace_video = load_frames(dataset, row["vace_video"][:num_frames])
+    vace_video = _control_vace_video(vace_video, control, width, height)
+    ref = Image.open(dataset / row["vace_reference_image"]).convert("RGB")
+    return pipe(
+        prompt=row.get("prompt", "robot arm manipulation"),
+        negative_prompt=NEG_PROMPT,
+        vace_video=vace_video,
+        height=height,
+        width=width,
+        num_frames=num_frames,
+        seed=seed,
+        tiled=False,
+        **first_frame_kwargs(spec, ref),
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset", required=True)
@@ -113,49 +170,17 @@ def main() -> None:
 
     dataset = Path(args.dataset).resolve()
     row = load_row(dataset, args.row)
-
-    vace_video = load_frames(dataset, row["vace_video"][: args.num_frames])
-    if args.control == "none":
-        vace_video = [Image.new("RGB", (args.width, args.height), (128, 128, 128)) for _ in vace_video]
-    elif args.control == "shuffle":
-        idx = list(range(len(vace_video)))[::-1]  # deterministic scramble: reverse
-        vace_video = [vace_video[i] for i in idx]
-    ref = Image.open(dataset / row["vace_reference_image"]).convert("RGB")
-
-    spec = get_spec(args.base_spec)
-    pipe = WanVideoPipeline.from_pretrained(
-        torch_dtype=torch.bfloat16,
-        device="cuda",
-        model_configs=[ModelConfig(path=p) for p in spec.model_paths()],
-        tokenizer_config=ModelConfig(spec.abs_tokenizer_path()),
-    )
-    # T2 seams: ensure VACE branch (SEAM-1) + install mask_pq-parameterized unit (SEAM-2).
-    vace = provision_a2v(pipe, spec)
-    _load_vace_weights(pipe, vace, args.lora, args.lora_alpha)
-
-    # SEAM-4 first frame: route `ref` (= GT frame 0, dataset invariant I4) by base mode.
-    #   * i2v_concat (I2V-14B, T4): `input_image` builds CLIP + VAE concat conditioning.
-    #   * ti2v_fused (TI2V-5B, T5): `input_image` is VAE-encoded into latent frame 0.
-    #   * vace_reference / legacy none: keep the prior VACE reference path.
-    # These are alternatives, not additive: native first-frame paths already inject frame 0,
-    # so we do NOT also pass vace_reference_image there. The causal control (real vs none)
-    # still lives entirely in vace_video.
-    frame_kwargs: dict = {}
-    if spec.first_frame_mode in ("i2v_concat", "ti2v_fused"):
-        frame_kwargs["input_image"] = ref
-    else:
-        frame_kwargs["vace_reference_image"] = ref
-
-    video = pipe(
-        prompt=row.get("prompt", "robot arm manipulation"),
-        negative_prompt=NEG_PROMPT,
-        vace_video=vace_video,
+    pipe, spec = build_pipe_with_vace(args.base_spec, args.lora, args.lora_alpha)
+    video = generate_one(
+        pipe=pipe,
+        spec=spec,
+        row=row,
+        dataset=dataset,
+        control=args.control,
         height=args.height,
         width=args.width,
         num_frames=args.num_frames,
         seed=args.seed,
-        tiled=False,
-        **frame_kwargs,
     )
     out = Path(args.output)
     out.parent.mkdir(parents=True, exist_ok=True)

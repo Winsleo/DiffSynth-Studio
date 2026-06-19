@@ -59,6 +59,9 @@ full-param) are chosen from the spec:
 ```bash
 bash a2v/run_overfit.sh wan2.2-ti2v-5b
 # override any preset via env: LR=1e-5 OUT=... HEIGHT=256 bash a2v/run_overfit.sh <spec>
+# multi-episode knobs keep old defaults unless set:
+# FRAMES=105 REPEAT=1 EPOCHS=120 OUT=... DATASET=... bash a2v/run_overfit.sh wan2.1-vace-1.3b
+# DRY_RUN=1 prints the resolved command without launching training.
 ```
 
 Checkpoints land in `models/train/.../step-*.safetensors` (LoRA for vace-1.3b, full vace
@@ -84,7 +87,32 @@ clearly closer to GT than the negative control. For i2v/ti2v bases the negative 
 not expected to be static (they freely animate from frame 0); the signal is `REAL ≪ NONE`
 on MAE-GT plus a non-trivial real-vs-none difference.
 
-## 4. Pre-flight / provision checks
+## 4. Multi-episode train + eval
+
+For the first formal generalization run, train VACE-1.3B LoRA on RoboTwin ep0-39 and evaluate ep40-49:
+
+```bash
+PY=.venv/bin/python
+FRAMES=105 REPEAT=1 EPOCHS=120 \
+OUT=models/train/a2v_robotwin_train40_vace1p3b_lora \
+DATASET=.cache/a2v_robotwin/ep_train40_phys \
+CUDA_VISIBLE_DEVICES=0 bash a2v/run_overfit.sh wan2.1-vace-1.3b
+
+CK=models/train/a2v_robotwin_train40_vace1p3b_lora/step-4800.safetensors
+$PY -m a2v.eval_multiep --base_spec wan2.1-vace-1.3b --lora $CK \
+  --dataset .cache/a2v_robotwin/ep_heldout10_phys --num_frames 105 --height 240 --width 320 \
+  --controls real,none --output_dir .cache/a2v_robotwin/eval_heldout
+$PY -m a2v.eval_multiep --base_spec wan2.1-vace-1.3b --lora $CK \
+  --dataset .cache/a2v_robotwin/ep_train40_phys --rows 0,1,2,3,4 \
+  --num_frames 105 --height 240 --width 320 --controls real,none \
+  --output_dir .cache/a2v_robotwin/eval_train
+```
+
+`eval_multiep.py` loads the model once, generates all requested controls, saves mp4s, writes `metrics.json`, and prints a per-episode table plus one `SUMMARY`. The gate is cross-base: mean REAL MAE-GT below NONE, real<none on most episodes, real motion in the same order as GT, and non-trivial real-vs-none difference.
+
+2026-06-18 VACE-1.3B train40 result: held-out ep40-49 PASS (`mean_real_mae=6.25`, `mean_none_mae=26.83`, `real_lt_none=10/10`, `mean_motion_ratio=1.03`); train subset ep0-4 PASS (`6.35` vs `29.89`, `5/5`, ratio `1.02`).
+
+## 5. Pre-flight / provision checks
 
 ```bash
 $PY -m a2v.check_load          --base_spec wan2.2-ti2v-5b   # loads + builds VACE branch
@@ -107,6 +135,7 @@ a2v/
   vace_unit.py        SEAM-2: mask_pq-parameterized VACE unit (no diffsynth edit)
   train_a2v.py        thin trainer wrapper (frame-list operator + from-DiT vace build)
   infer_a2v.py        inference + causal-control harness
+  eval_multiep.py     multi-row generalization evaluator, model loaded once
   causal_metrics.py   MAE-GT / motion / real-vs-none gate metrics
   run_overfit.sh      unified single-sample overfit (takes <base_spec>)
   check_load.py       load smoke (any base)

@@ -4,9 +4,15 @@
 > 这件事的目标、已核实事实、已产出文档、当前代码状态、以及待办与阻塞点。
 > 详细内容散在 `.cache/analysis/` 的各专题文档里，本文给出索引与摘要。
 
-最后更新：2026-06-16。
+最后更新：2026-06-18。
 
 > ## ⭐ 接手清单（新会话先读这一段）
+> **Multi-episode VACE-1.3B 已正式训练/PASS（2026-06-18）**：train=ep0-39，held-out=ep40-49，105 帧，240x320。
+> final LoRA：`models/train/a2v_robotwin_train40_vace1p3b_lora/step-4800.safetensors`。
+> held-out：REAL MAE-GT=**6.25**、NONE=**26.83**、real<none=**10/10**、motion ratio=**1.03**、real-vs-none=**26.68**，PASS。
+> train subset ep0-4：REAL=**6.35**、NONE=**29.89**、real<none=**5/5**、motion ratio=**1.02**，PASS。
+> 评测视频与 metrics：`.cache/a2v_robotwin/eval_heldout/`、`.cache/a2v_robotwin/eval_train/`。
+>
 > **T5 (Wan2.2-TI2V-5B) 已打通/PASS（2026-06-16）**：SEAM-2 新 VAE 路径可用。
 > `wan2.2-ti2v-5b` 已接入：`z_dim=48`、`vae_spatial_factor=16` →
 > `vace_in_dim=352`/`mask_pq=16`，`first_frame_mode="ti2v_fused"`，15 层 VACE。
@@ -55,7 +61,7 @@
 > 视频：`.cache/a2v_robotwin/gen_i2v_lr{5e6,1e5,2e5}_s1000_{real,none}.mp4`。
 > 复现/覆盖：`LR=<lr> OUT=<dir> CUDA_VISIBLE_DEVICES=<g> bash a2v/run_overfit.sh wan2.1-i2v-14b-480p`（默认 `LR=1e-5`）。
 >
-> **下一步**：推进 **T6 I2V-A14B**（SEAM-5 双专家：Fun-A14B 的 `vace`/`vace2`、boundary=0.875、分带训练/验证），或先做 T1/T3/T4/T5 多 episode 泛化。见 §4.2/§5。
+> **下一步**：推进 **I2V-14B 多 episode**（复用 `.cache/a2v_robotwin/ep_train40_phys` / `ep_heldout10_phys` 与 `a2v.eval_multiep`，从 `LR=1e-5` 起步）；之后再做 **T6 I2V-A14B**（SEAM-5 双专家：Fun-A14B 的 `vace`/`vace2`、boundary=0.875、分带训练/验证）。见 §15/§4.2/§5。
 > **勿用的坏产物**：`models/train/a2v_robotwin_ep0_vace_i2v/step-*`（8-bit lr=1e-4 噪声 ckpt）。
 > 其余背景见 `A2V_HISTORY.md` §12（T4 调试史）、§13（06-16 比对 ABot + lr 修复全过程）、§14（T5 终态）。
 
@@ -77,7 +83,7 @@ Wan2.1-VACE-1.3B → Wan2.1-T2V-1.3B → Wan2.1-I2V-14B-480P → Wan2.2-TI2V-5B 
 ```
 
 两个代码库：
-- **DiffSynth-Studio**：`/vepfs/wangshilong/code/DiffSynth-Studio`（改造在这里，commit `e5f88f0`）
+- **DiffSynth-Studio**：`/vepfs/wangshilong/code/DiffSynth-Studio`（改造在这里，分支 `a2v`）
 - **ABot-PhysWorld**：`/vepfs/wangshilong/code/ABot-PhysWorld`（参考实现 + 分析文档在 `.cache/analysis/`）
 
 ---
@@ -156,7 +162,8 @@ P=Q **必须等于 VAE 空间压缩因子**（否则崩）——这是 master pl
 | `check_load.py` | **[统一,06-17]** `--base_spec` 加载冒烟(取代 check_t4_load/check_t5_load):DiT层数/VAE z·s/造 vace(in_dim·层数·after_proj=0)/mask_pq;i2v 验 CLIP+in_dim36,ti2v 验 in_dim48+fused |
 | `causal_metrics.py` | **[可复用]** 因果门度量 MAE-GT/motion/real-vs-none;H,W 默认从 GT PNG 自动派生(§12) |
 | `train_a2v.py` | **[T1/T2/T5]** 薄训练封装(swap operator)+`--base_spec`+`provision_a2v`；按 spec 派生数据整除因子 |
-| `infer_a2v.py` | **[T1/T2/T4/T5]** 推理 harness;`--base_spec`/`--control real\|none\|shuffle`；I2V/TI2V 首帧走 `input_image` |
+| `infer_a2v.py` | **[T1/T2/T4/T5]** 推理 harness;`--base_spec`/`--control real\|none\|shuffle`；I2V/TI2V 首帧走 `input_image`；现抽出可 import 的 build/generate 函数供多行评测复用 |
+| `eval_multiep.py` | **[M1]** 多 episode 泛化评测；模型只加载一次，逐行生成 real/none，输出 mp4 + metrics.json + SUMMARY |
 | `run_overfit.sh` | **[T1/T2]** 单样本 LoRA 过拟合(spec 驱动) |
 | `check_parity.py` | **[T2]** 零行为变更对拍闸门(§8) |
 | `README_A2V.md` | 用法 + 训练接线前向依赖 + reference 帧语义 |
@@ -175,6 +182,7 @@ P=Q **必须等于 VAE 空间压缩因子**（否则崩）——这是 master pl
 | T3 接入 T2V-1.3B | ✅ PASS (06-14) | SEAM-1「从 DiT 造 VACE」。3 道 provision 门 + 全参过拟合因果门(REAL MAE-GT 20.9/NONE 静止 0.68/real-none 41.6)。**关键纠错:LoRA 不可训 from-DiT vace,且 patch_embedding 不可与 before_proj 同时零初始化(死锁)**。详见 §11 |
 | **T4 接入 I2V-14B** | ✅ **PASS/定稿** (06-16) | 真因=**lr 1e-4 过高**(非 8-bit Adam/非缺 vace_reference)。三组 step-1000 lr 扫描完成，**lr1e5 胜出**:REAL MAE-GT **4.83**、motion 4.94≈GT 4.78、NONE MAE-GT 36.04、real-none 36.79。`run_overfit.sh` 默认已改 `1e-5`。详见 §12/§13 |
 | **T5 接入 TI2V-5B** | ✅ **PASS** (06-16) | SEAM-2 新 VAE 打通：`vace_in_dim=352`/`mask_pq=16`，256×320 数据、load/provision/1000步过拟合/real-none-shuffle 因果门全过。REAL MAE-GT **5.27**，NONE 15.62，SHUFFLE 14.91。详见 §14 |
+| **M1 VACE-1.3B 多 episode** | ✅ **PASS** (06-18) | train40/heldout10，105 帧，240x320，LoRA step-4800。held-out REAL MAE-GT **6.25** vs NONE **26.83**，real<none **10/10**，motion ratio **1.03**。详见 §15 |
 
 **环境（已解决,不要再找）**：venv 在 `/vepfs/wangshilong/code/DiffSynth-Studio/.venv`。
 `.venv/bin/python` 已含 torch 2.5.1+cu121 / numpy / einops / PIL / imageio / **h5py / tensorboard**。

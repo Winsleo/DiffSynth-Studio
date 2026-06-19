@@ -487,3 +487,64 @@ $PY -m a2v.causal_metrics --dataset .cache/a2v_robotwin/ep0_dataset_phys_256x320
 - 自动记忆：`find /vepfs/wangshilong/code -maxdepth 5 -type f \( -name 'MEMORY.md' -o -name 'a2v-robotwin-convention.md' \)` 未找到文件；只找到本文 `a2v/A2V_HANDOFF.md`。若后续会话需要“记忆同步”，先确认这些文件是否在别的路径或由外部系统托管。
 - 工作区：本轮代码和文档仍未提交；`a2v/A2V_HANDOFF.md`、`check_t5_load.py`、`run_overfit_ti2v.sh`、`causal_metrics.py` 等为当前工作区产物。继续前先看 `git status --short`，不要误删未跟踪文件。
 - 工具注意：某些 agent sandbox 下 `apply_patch`/普通读写曾因 `bwrap: No permissions to create a new namespace` 失败；实际文件位于可写根下，必要时使用已授权的外部 shell/Python 做定点替换，并在替换脚本里检查锚点。
+
+---
+
+## 15. Multi-episode generalization (2026-06-18, VACE-1.3B LoRA, PASS)
+
+**结论：VACE-1.3B LoRA 的正式多 episode 泛化门通过。** 使用 RoboTwin `beat_block_hammer/aloha-agilex_clean_50`，train=ep0-39，held-out=ep40-49，105 帧，240x320。同一个 final LoRA 在 held-out 10 个未见 episode 上满足主判据：REAL 明显比 NONE 更接近 GT，且 10/10 episode 均 real<none；REAL motion 与 GT 同量级。
+
+### 15.1 代码与数据
+- `run_overfit.sh` 增加 `REPEAT` / `EPOCHS` / `DRY_RUN` env override；默认仍是 `REPEAT=100`、`EPOCHS=10`、`FRAMES=121`，不破坏单样本过拟合复现。
+- `infer_a2v.py` 抽出 `build_pipe_with_vace`、`first_frame_kwargs`、`generate_one`，供单行 CLI 与多行评测复用；原 CLI 参数保持不变。
+- 新增 `a2v/eval_multiep.py`：一次加载模型，按 metadata 行循环生成 `real,none`，保存 mp4，写 `metrics.json`，打印逐 episode 表和 SUMMARY。
+- 数据集已 validate：`.cache/a2v_robotwin/ep_train40_phys` 40 行、`.cache/a2v_robotwin/ep_heldout10_phys` 10 行；每行 105 帧、240x320。
+
+### 15.2 训练配方
+```bash
+FRAMES=105 REPEAT=1 EPOCHS=120 \
+OUT=models/train/a2v_robotwin_train40_vace1p3b_lora \
+DATASET=.cache/a2v_robotwin/ep_train40_phys \
+CUDA_VISIBLE_DEVICES=0 bash a2v/run_overfit.sh wan2.1-vace-1.3b
+```
+- 步数：40 rows * 120 epochs = 4800 steps；最终 ckpt `models/train/a2v_robotwin_train40_vace1p3b_lora/step-4800.safetensors`，大小 43,781,016 bytes。
+- TensorBoard loss：4800 条；step1=0.01057，step1000=0.00974，step2400=0.02093，step4800=0.01559；全程有波动但未发散，最终以 causal eval gate 为准。
+
+### 15.3 Held-out 10 ep 结果
+```text
+rows=10 mean_real_mae=6.25 mean_none_mae=26.83 real_lt_none=10/10
+mean_real_motion=5.18 mean_none_motion=0.57 mean_gt_motion=5.01
+mean_motion_ratio=1.03 mean_real_vs_none=26.68 verdict=PASS
+```
+产物：`.cache/a2v_robotwin/eval_heldout/row*_ep*_real.mp4`、`row*_ep*_none.mp4`、`metrics.json`。
+
+### 15.4 Train subset 对照
+```text
+rows=5 mean_real_mae=6.35 mean_none_mae=29.89 real_lt_none=5/5
+mean_real_motion=5.18 mean_none_motion=0.74 mean_gt_motion=5.06
+mean_motion_ratio=1.02 mean_real_vs_none=30.30 verdict=PASS
+```
+产物：`.cache/a2v_robotwin/eval_train/row*_ep*_real.mp4`、`row*_ep*_none.mp4`、`metrics.json`。
+
+### 15.5 复现命令
+```bash
+PY=.venv/bin/python
+for d in ep_train40_phys ep_heldout10_phys; do
+  $PY -m a2v.data.validate --base_spec wan2.1-vace-1.3b \
+    --dataset_base_path .cache/a2v_robotwin/$d \
+    --dataset_metadata_path .cache/a2v_robotwin/$d/metadata.jsonl \
+    --height 240 --width 320 --num_frames 105 --max_items 50
+done
+
+CK=models/train/a2v_robotwin_train40_vace1p3b_lora/step-4800.safetensors
+$PY -m a2v.eval_multiep --base_spec wan2.1-vace-1.3b --lora $CK \
+  --dataset .cache/a2v_robotwin/ep_heldout10_phys --num_frames 105 --height 240 --width 320 \
+  --controls real,none --output_dir .cache/a2v_robotwin/eval_heldout
+$PY -m a2v.eval_multiep --base_spec wan2.1-vace-1.3b --lora $CK \
+  --dataset .cache/a2v_robotwin/ep_train40_phys --rows 0,1,2,3,4 \
+  --num_frames 105 --height 240 --width 320 --controls real,none \
+  --output_dir .cache/a2v_robotwin/eval_train
+```
+
+### 15.6 下一步
+同份 240x320 / 105-frame train40+heldout10 数据直接推进 **I2V-14B 多 episode**。沿用 `eval_multiep.py`；训练侧注意 14B 用 8-bit Adam、`LR=1e-5` 起步，必要时再引入 encoded-cache 提速和降显存。
