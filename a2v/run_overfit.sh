@@ -20,7 +20,7 @@
 #   * resolution: TI2V's Wan2.2 VAE is 16x spatial x patch 2 = 32x, so H,W must be /32 ->
 #     use the 256x320 dataset (240 is not divisible by 32).
 #
-# Env overrides:  LR=  DATASET=  OUT=  HEIGHT=  WIDTH=  FRAMES=  REPEAT=  EPOCHS=  DRY_RUN=1
+# Env overrides:  LR=  DATASET=  OUT=  HEIGHT=  WIDTH=  FRAMES=  REPEAT=  EPOCHS=  NPROC=  DRY_RUN=1
 #
 # Causal gate afterwards (real reconstructs GT; none/shuffle do not):
 #   for c in real none; do .venv/bin/python -m a2v.infer_a2v --base_spec <base_spec> \
@@ -70,6 +70,7 @@ WIDTH="${WIDTH:-$WIDTH_DEFAULT}"
 FRAMES="${FRAMES:-121}"
 REPEAT="${REPEAT:-100}"
 EPOCHS="${EPOCHS:-10}"
+NPROC="${NPROC:-1}"     # data-parallel GPUs (DDP). 1 = single GPU (unchanged default).
 DRY_RUN="${DRY_RUN:-0}"
 
 # first-frame seam -> which inputs to feed
@@ -97,9 +98,9 @@ else
   OPT_ARGS+=(--use_gradient_checkpointing_offload)
 fi
 
-echo "[run_overfit] spec=$SPEC dataset=$DATASET out=$OUT ${HEIGHT}x${WIDTH} frames=$FRAMES repeat=$REPEAT epochs=$EPOCHS lr=$LR mode=$TRAIN_MODE opt=$OPTIMIZER first_frame=$FIRST_FRAME"
+echo "[run_overfit] spec=$SPEC dataset=$DATASET out=$OUT ${HEIGHT}x${WIDTH} frames=$FRAMES repeat=$REPEAT epochs=$EPOCHS nproc=$NPROC lr=$LR mode=$TRAIN_MODE opt=$OPTIMIZER first_frame=$FIRST_FRAME"
 
-CMD=(.venv/bin/accelerate launch --num_processes 1 --mixed_precision bf16 -m a2v.train_a2v \
+CMD=(.venv/bin/accelerate launch --num_processes "$NPROC" --mixed_precision bf16 -m a2v.train_a2v \
   --base_spec "$SPEC" \
   --dataset_base_path "$DATASET" \
   --dataset_metadata_path "$DATASET/metadata.jsonl" \

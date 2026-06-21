@@ -548,3 +548,52 @@ $PY -m a2v.eval_multiep --base_spec wan2.1-vace-1.3b --lora $CK \
 
 ### 15.6 下一步
 同份 240x320 / 105-frame train40+heldout10 数据直接推进 **I2V-14B 多 episode**。沿用 `eval_multiep.py`；训练侧注意 14B 用 8-bit Adam、`LR=1e-5` 起步，必要时再引入 encoded-cache 提速和降显存。
+
+---
+
+## 16. Multi-episode generalization (2026-06-21, I2V-14B, 8-GPU DDP, PASS)
+
+**结论：I2V-14B（生产基模）多 episode 泛化门通过，且强于 1.3B。** 复用同一份 train40/heldout10（240×320, 105 帧）数据，
+8 卡 DDP 训练 from-DiT 全参 vace，held-out 10 个未见 episode **10/10 real<none**、REAL MAE-GT 4.25 ≪ NONE 30.09、
+motion ratio 1.06；held-out(4.25) 与 train(4.76) 几乎无 gap ⇒ 真泛化非记忆。
+
+### 16.1 代码硬化（eval_multiep）+ 多卡（run_overfit.sh）
+- `eval_multiep.py`：**A1 每行 try/except**（单行失败记 `failures`、从聚合剔除、不中断整轮，metrics.json 加 `failures`/`failed`）；
+  **A2 motion_ratio nan 防御**（聚合仅用有限值；全静止导致 nan 时跳过 ratio 子条件，主判据仍判）。1.3B held-out 复跑结果逐位一致（real=6.25/10-10/failed=0）= 零回归。
+- `run_overfit.sh`：加 `NPROC` env（普通 accelerate DDP，默认 1 不变）。8 卡 20 步 smoke 干净退出，from-DiT vace 在 DDP 下每 rank 确定性克隆、训练正常、无 OOM。
+
+### 16.2 训练配方（8 卡 DDP）
+```bash
+NPROC=8 FRAMES=105 LR=1e-5 REPEAT=4 EPOCHS=40 \
+OUT=models/train/a2v_robotwin_train40_vace_i2v \
+DATASET=.cache/a2v_robotwin/ep_train40_phys \
+bash a2v/run_overfit.sh wan2.1-i2v-14b-480p
+```
+- 步数：`EPOCHS×(40×REPEAT)/NPROC = 40×160/8 = 800` 步（≈6400 sample-exposures）；~10s/it、每卡 ~80GB（8-bit + grad-ckpt，紧但不 OOM）、约 2.2h。
+- loss：800 步从 ~0.06 降到 0.001–0.01，平稳无发散（lr=1e-5，对比单 ep lr=1e-4 发散）。
+- final ckpt `models/train/a2v_robotwin_train40_vace_i2v/step-800.safetensors`（6.5GB，276 keys 全参 vace `vace_blocks.*`/`vace_patch_embedding.*`，无 lora/pipe 前缀）。
+
+### 16.3 评测结果（step-800）
+| 集合 | REAL MAE-GT | NONE MAE-GT | real<none | motion ratio | real-vs-none |
+| --- | --- | --- | --- | --- | --- |
+| **held-out ep40-49** | **4.25** | 30.09 | **10/10** | 1.06 | 30.21 |
+| train ep0-4 | 4.76 | 32.10 | 5/5 | 1.06 | 32.19 |
+- 每个 held-out episode 均 real<none，REAL MAE 稳定 3.8–4.8；REAL motion 5.31≈GT 5.01。**PASS**。
+- 与 1.3B 多 ep 对照（held-out REAL 6.25）：14B 更准，泛化更强。
+- 产物：`.cache/a2v_robotwin/eval_heldout_i2v/`、`eval_train_i2v/`（含 mp4 + metrics.json）。
+
+### 16.4 复现命令
+```bash
+PY=.venv/bin/python
+# 训练见 16.2；评测：
+CK=models/train/a2v_robotwin_train40_vace_i2v/step-800.safetensors
+CUDA_VISIBLE_DEVICES=0 $PY -m a2v.eval_multiep --base_spec wan2.1-i2v-14b-480p --lora $CK \
+  --dataset .cache/a2v_robotwin/ep_heldout10_phys --num_frames 105 --height 240 --width 320 \
+  --controls real,none --output_dir .cache/a2v_robotwin/eval_heldout_i2v
+```
+
+### 16.5 下一步
+- （可选提速/降显存）encoded-cache（ABot 思路，`A2V_HISTORY.md §13.3`）：跳过 VAE/T5/CLIP 重编码，对 14B 多 ep/多 epoch 收益大。
+- 更大规模：更多 episode / 多 task 混训、或扩 held-out。
+- **T6 Wan2.2-I2V-A14B**（SEAM-5 双专家 MoE）：master plan 最后一个基模。
+- eval_multiep 当前每行重编码（无 latent 缓存），14B 上 10 行 held-out ~40min；若评测规模变大可加缓存（计划书 Part A3，本轮未做）。

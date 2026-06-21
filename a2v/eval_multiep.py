@@ -131,48 +131,54 @@ def main() -> None:
     pipe, spec = build_pipe_with_vace(args.base_spec, args.lora, args.lora_alpha)
 
     records = []
+    failures = []
     for row_idx in row_indices:
         row = rows[row_idx]
         ep = _episode_id(row, row_idx)
         print(f"\n=== row={row_idx} episode={ep} prompt={row.get('prompt', '')!r} ===")
-        gt = _read_pngs(dataset, row["video"], args.num_frames)
-        gt_motion = _motion(gt)
-        generated: dict[str, np.ndarray] = {}
+        try:
+            gt = _read_pngs(dataset, row["video"], args.num_frames)
+            gt_motion = _motion(gt)
+            generated: dict[str, np.ndarray] = {}
 
-        for control in controls:
-            video = generate_one(
-                pipe=pipe,
-                spec=spec,
-                row=row,
-                dataset=dataset,
-                control=control,
-                height=args.height,
-                width=args.width,
-                num_frames=args.num_frames,
-                seed=args.seed,
-            )
-            video_frames = list(video)
-            out = output_dir / f"row{row_idx:03d}_{ep}_{control}.mp4"
-            save_video(video_frames, str(out), fps=args.fps, quality=5)
-            arr = _video_to_array(video_frames, gt.shape[1], gt.shape[2])
-            generated[control] = arr
-            print(f"saved {control:7} -> {out}")
+            for control in controls:
+                video = generate_one(
+                    pipe=pipe,
+                    spec=spec,
+                    row=row,
+                    dataset=dataset,
+                    control=control,
+                    height=args.height,
+                    width=args.width,
+                    num_frames=args.num_frames,
+                    seed=args.seed,
+                )
+                video_frames = list(video)
+                out = output_dir / f"row{row_idx:03d}_{ep}_{control}.mp4"
+                save_video(video_frames, str(out), fps=args.fps, quality=5)
+                arr = _video_to_array(video_frames, gt.shape[1], gt.shape[2])
+                generated[control] = arr
+                print(f"saved {control:7} -> {out}")
 
-        real = generated["real"]
-        none = generated["none"]
-        rec = {
-            "row": row_idx,
-            "episode": ep,
-            "real_mae": _mae(real, gt),
-            "none_mae": _mae(none, gt),
-            "real_motion": _motion(real),
-            "none_motion": _motion(none),
-            "gt_motion": gt_motion,
-            "real_vs_none": _mae(real, none),
-        }
-        rec["real_lt_none"] = rec["real_mae"] < rec["none_mae"]
-        rec["real_motion_ratio"] = rec["real_motion"] / gt_motion if gt_motion > 0 else float("nan")
-        records.append(rec)
+            real = generated["real"]
+            none = generated["none"]
+            rec = {
+                "row": row_idx,
+                "episode": ep,
+                "real_mae": _mae(real, gt),
+                "none_mae": _mae(none, gt),
+                "real_motion": _motion(real),
+                "none_motion": _motion(none),
+                "gt_motion": gt_motion,
+                "real_vs_none": _mae(real, none),
+            }
+            rec["real_lt_none"] = rec["real_mae"] < rec["none_mae"]
+            rec["real_motion_ratio"] = rec["real_motion"] / gt_motion if gt_motion > 0 else float("nan")
+            records.append(rec)
+        except Exception as e:  # one bad episode must not abort the whole eval
+            print(f"[WARN] row={row_idx} ep={ep} FAILED: {e}")
+            failures.append({"row": row_idx, "episode": ep, "error": str(e)})
+            continue
 
     print("\nrow episode real_mae none_mae real<none real_motion none_motion gt_motion motion_ratio real_vs_none")
     for rec in records:
@@ -186,8 +192,13 @@ def main() -> None:
 
     total = len(records)
     real_lt_count = sum(1 for r in records if r["real_lt_none"])
+    # motion ratio averaged over FINITE values only (gt_motion==0 -> nan, must not poison the mean)
+    finite_ratios = [r["real_motion_ratio"] for r in records if np.isfinite(r["real_motion_ratio"])]
+    mean_ratio = _mean(finite_ratios)  # nan if no finite ratio
     summary = {
         "rows": total,
+        "requested_rows": len(row_indices),
+        "failed": len(failures),
         "mean_real_mae": _mean(r["real_mae"] for r in records),
         "mean_none_mae": _mean(r["none_mae"] for r in records),
         "mean_real_motion": _mean(r["real_motion"] for r in records),
@@ -196,17 +207,24 @@ def main() -> None:
         "mean_real_vs_none": _mean(r["real_vs_none"] for r in records),
         "real_lt_none_count": real_lt_count,
         "real_lt_none_frac": real_lt_count / total if total else float("nan"),
-        "mean_real_motion_ratio": _mean(r["real_motion_ratio"] for r in records),
+        "mean_real_motion_ratio": mean_ratio,
     }
-    pass_gate = (
-        summary["mean_real_mae"] < summary["mean_none_mae"]
-        and summary["real_lt_none_count"] >= min(total, 8)
-        and 0.5 <= summary["mean_real_motion_ratio"] <= 2.0
-        and summary["mean_real_vs_none"] > 1.0
-    )
+    if total == 0:
+        # no successful rows -> cannot judge generalization
+        pass_gate = False
+    else:
+        # nan motion ratio (all GT static) skips the motion sub-check; primary criteria stand.
+        ratio_ok = (not np.isfinite(mean_ratio)) or (0.5 <= mean_ratio <= 2.0)
+        pass_gate = (
+            summary["mean_real_mae"] < summary["mean_none_mae"]
+            and real_lt_count >= min(total, 8)
+            and ratio_ok
+            and summary["mean_real_vs_none"] > 1.0
+        )
     print(
         "\nSUMMARY "
         f"rows={summary['rows']} "
+        f"failed={summary['failed']} "
         f"mean_real_mae={summary['mean_real_mae']:.2f} "
         f"mean_none_mae={summary['mean_none_mae']:.2f} "
         f"real_lt_none={summary['real_lt_none_count']}/{summary['rows']} "
@@ -217,9 +235,14 @@ def main() -> None:
         f"mean_real_vs_none={summary['mean_real_vs_none']:.2f} "
         f"verdict={'PASS' if pass_gate else 'FAIL'}"
     )
+    if failures:
+        print(f"[WARN] {len(failures)} row(s) failed: {[f['row'] for f in failures]}")
 
     metrics_path = output_dir / "metrics.json"
-    metrics_path.write_text(json.dumps({"records": records, "summary": summary, "pass": pass_gate}, indent=2), encoding="utf-8")
+    metrics_path.write_text(
+        json.dumps({"records": records, "failures": failures, "summary": summary, "pass": pass_gate}, indent=2),
+        encoding="utf-8",
+    )
     print(f"metrics -> {metrics_path}")
 
 

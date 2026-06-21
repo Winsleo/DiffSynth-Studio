@@ -4,14 +4,18 @@
 > 这件事的目标、已核实事实、已产出文档、当前代码状态、以及待办与阻塞点。
 > 详细内容散在 `.cache/analysis/` 的各专题文档里，本文给出索引与摘要。
 
-最后更新：2026-06-18。
+最后更新：2026-06-21。
 
 > ## ⭐ 接手清单（新会话先读这一段）
-> **Multi-episode VACE-1.3B 已正式训练/PASS（2026-06-18）**：train=ep0-39，held-out=ep40-49，105 帧，240x320。
-> final LoRA：`models/train/a2v_robotwin_train40_vace1p3b_lora/step-4800.safetensors`。
-> held-out：REAL MAE-GT=**6.25**、NONE=**26.83**、real<none=**10/10**、motion ratio=**1.03**、real-vs-none=**26.68**，PASS。
-> train subset ep0-4：REAL=**6.35**、NONE=**29.89**、real<none=**5/5**、motion ratio=**1.02**，PASS。
-> 评测视频与 metrics：`.cache/a2v_robotwin/eval_heldout/`、`.cache/a2v_robotwin/eval_train/`。
+> **Multi-episode I2V-14B 已训练/PASS（2026-06-21，8 卡 DDP）**：train=ep0-39，held-out=ep40-49，105 帧，240x320。
+> final ckpt（全参 vace）：`models/train/a2v_robotwin_train40_vace_i2v/step-800.safetensors`。
+> **held-out：REAL MAE-GT=4.25、NONE=30.09、real<none=10/10、motion ratio=1.06、real-vs-none=30.21，PASS**（比 1.3B 更强、与 train 几乎无 gap）。
+> 配方 `NPROC=8 FRAMES=105 LR=1e-5 REPEAT=4 EPOCHS=40 bash a2v/run_overfit.sh wan2.1-i2v-14b-480p`（800 步~2.2h）。评测：`.cache/a2v_robotwin/eval_heldout_i2v/`。详见 `A2V_HISTORY.md §16`。
+>
+> **Multi-episode VACE-1.3B PASS（2026-06-18）**：同数据 LoRA `models/train/a2v_robotwin_train40_vace1p3b_lora/step-4800.safetensors`；
+> held-out REAL=6.25/NONE=26.83/10-10/PASS。详见 `A2V_HISTORY.md §15`。
+>
+> **工具**：`a2v.eval_multiep --base_spec <s> --lora <ckpt> --dataset <heldout> --controls real,none` 多行泛化评测（模型只加载一次、per-row 容错、聚合判定 + metrics.json）。`run_overfit.sh` 支持 `NPROC=`（多卡 DDP）+ `REPEAT/EPOCHS/FRAMES`（多 ep 配方），默认仍是单卡单 ep 过拟合。
 >
 > **T5 (Wan2.2-TI2V-5B) 已打通/PASS（2026-06-16）**：SEAM-2 新 VAE 路径可用。
 > `wan2.2-ti2v-5b` 已接入：`z_dim=48`、`vae_spatial_factor=16` →
