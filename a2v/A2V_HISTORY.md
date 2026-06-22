@@ -597,3 +597,61 @@ CUDA_VISIBLE_DEVICES=0 $PY -m a2v.eval_multiep --base_spec wan2.1-i2v-14b-480p -
 - 更大规模：更多 episode / 多 task 混训、或扩 held-out。
 - **T6 Wan2.2-I2V-A14B**（SEAM-5 双专家 MoE）：master plan 最后一个基模。
 - eval_multiep 当前每行重编码（无 latent 缓存），14B 上 10 行 held-out ~40min；若评测规模变大可加缓存（计划书 Part A3，本轮未做）。
+
+---
+
+## 17. Encoded-cache 两阶段训练（2026-06-22，提速+降显存，PASS）
+
+**结论：encoded-cache 打通，I2V-14B 多 ep 训练每步快 ~31%、每卡省 ~9GB，泛化不退化。** 关键发现：**stock DiffSynth 已内置该机制**（`:data_process` 预编码 → `load_from_cache` 训练），无需移植 ABot 的自定义实现；只需给 `train_a2v` 加一个 `--cache_train` 开关。
+
+### 17.1 机制（stock，复用）
+- **阶段A 预编码** `--task sft:data_process`：`split_pipeline_units` 只保留编码器单元，跑一遍把每个 episode 的编码器输出存成 `.pth`（`launch_data_process_task` → `{output}/{rank}/{data_id}.pth`）。实测缓存内容：`input_latents`、`context`(T5 posi/nega)、`vace_context`(96ch)、i2v 另含 `clip_feature`(1,257,1280) 与 `y`(1,20,T,H,W)。
+- **阶段B cache-train** `metadata_path=None` → `UnifiedDataset.load_from_cache`（递归找 `*.pth`）；训练 `forward` 跳过 `get_pipeline_inputs`，编码器单元不跑。配 `--cache_train` 后**只加载 DiT**（不载 T5/VAE/CLIP）。每步仍随机采 noise/timestep（保持训练随机性）。
+
+### 17.2 代码（仅 `a2v/`）
+- `train_a2v.py`：加 `--cache_train`。① `model_paths` 砍到只剩 DiT 条目（`spec.model_paths()[0]`，含 dit_glob 分片 list；VACE-1.3B 的 DiT ckpt 自带 vace 权重，from-DiT 基模由 `ensure_vace` 从 DiT 造）；② `dataset_metadata_path=None` 触发 load_from_cache。
+- **修了一个集成 bug**：`--task sft:train` 会把编码器侧 `WanVideoUnit_VACE`（产 `vace_context`）从 `pipe.units` split 掉，原 `provision_a2v` 的 `install_vace_unit` 因此报 "No WanVideoUnit_VACE found"。cache 模式下 `vace_context` 已缓存、不需该编码器单元，故 cache_train 只调 `ensure_vace`（建 vace 模型）、**跳过 install_vace_unit**。
+- `run_overfit.sh` 的 `NPROC`（§16）用于多卡 cache-train。
+
+### 17.3 实测（I2V-14B，train40，8 卡 DDP，800 步）
+| | 非缓存（§16） | cache-train |
+| --- | --- | --- |
+| 每步 | ~10 s/it | **6.96 s/it（−31%）** |
+| 每卡显存 | ~80 GB（贴 OOM） | **~71 GB（多 ~9GB 余量）** |
+| 加载 | dit+t5+vae+clip | **仅 dit** |
+| 800 步耗时 | ~2.2h | **~1.5h** |
+- 缓存：`.cache/a2v_robotwin/cache_train40_i2v`（40 个 `.pth`，4.1GB；vace-1.3b 版在 `cache_train40_vace1p3b`）。
+- final ckpt `models/train/a2v_robotwin_train40_vace_i2v_cached/step-800.safetensors`（276 keys 全参 vace）。
+
+### 17.4 泛化（cache-trained，held-out ep40-49）
+| 集合 | REAL MAE-GT | NONE MAE-GT | real<none | ratio | 对照非缓存 |
+| --- | --- | --- | --- | --- | --- |
+| held-out | 5.30 | 42.71 | **10/10** | 1.07 | 非缓存 4.25/10-10 |
+| train ep0-4 | 4.96 | 38.88 | 5/5 | 1.06 | 非缓存 4.76/5-5 |
+- **PASS**，10/10 real<none、real≪none（~8×）。REAL MAE 5.30 vs 非缓存 4.25 的差异属**训练随机性**（cache 模式 noise/timestep 仍每步随机；DDP 下 load_from_cache 按文件 glob 顺序分片 ≠ metadata 顺序 → 不同 SGD 轨迹），**非缓存导致的退化**——cache 喂的就是非缓存会算出的同一批 latent。
+
+### 17.5 复现命令
+```bash
+PY=.venv/bin/python; D=.cache/a2v_robotwin/ep_train40_phys
+# 阶段A 预编码（单卡，一次性；i2v 缓存 clip_feature/y/vace_context/input_latents/context）
+CUDA_VISIBLE_DEVICES=0 .venv/bin/accelerate launch --num_processes 1 --mixed_precision bf16 -m a2v.train_a2v \
+  --base_spec wan2.1-i2v-14b-480p --task sft:data_process \
+  --dataset_base_path "$D" --dataset_metadata_path "$D/metadata.jsonl" \
+  --data_file_keys video,vace_video --extra_inputs vace_video,input_image \
+  --height 240 --width 320 --num_frames 105 --dataset_repeat 1 \
+  --output_path .cache/a2v_robotwin/cache_train40_i2v
+# 阶段B cache-train（8 卡 DDP，跳过编码器）
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 .venv/bin/accelerate launch --num_processes 8 --mixed_precision bf16 -m a2v.train_a2v \
+  --base_spec wan2.1-i2v-14b-480p --cache_train --task sft:train \
+  --dataset_base_path .cache/a2v_robotwin/cache_train40_i2v --data_file_keys video,vace_video \
+  --trainable_models vace --learning_rate 1e-5 --dataset_repeat 4 --num_epochs 40 --save_steps 100 \
+  --output_path models/train/a2v_robotwin_train40_vace_i2v_cached \
+  --customized_optimizer bitsandbytes.optim.Adam8bit --enable_tensorboard_log
+# 评测同 §16 的 eval_multiep（--lora .../step-800.safetensors）
+```
+
+### 17.6 注意/下一步
+- 缓存 key 是按 `data_id`（行号），**与分辨率/帧数/prompt/动作图无内容哈希**——换分辨率或重渲数据后**必须用新的 `--output_path` 缓存目录**，否则会复用过期 latent（沿用 ABot 的已知坑，stock 同样如此）。
+- 数据并行顺序：cache 的 `.pth` 按文件 glob 顺序被发现（非按 episode 号），DDP 分片与 metadata 顺序不同——结果等价但非逐位复现。
+- 显存进一步：编码器已不占（省 ~9GB/卡），DiT 本体 + 激活仍是大头；要再降需模型分片（ZeRO-3/FSDP）或更激进的 grad-ckpt。
+- 适用面：多 ep / 多 epoch 训练收益最大（一次编码、多轮复用）；单 ep 单轮过拟合收益小（编码只省一遍）。

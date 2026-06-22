@@ -4,9 +4,13 @@
 > 这件事的目标、已核实事实、已产出文档、当前代码状态、以及待办与阻塞点。
 > 详细内容散在 `.cache/analysis/` 的各专题文档里，本文给出索引与摘要。
 
-最后更新：2026-06-21。
+最后更新：2026-06-22。
 
 > ## ⭐ 接手清单（新会话先读这一段）
+> **Encoded-cache 提速/降显存 PASS（2026-06-22）**：stock DiffSynth 自带 `:data_process`→`load_from_cache`，加 `--cache_train`
+> 即可只载 DiT、跳过 T5/VAE/CLIP。I2V-14B 多 ep cache-train **6.96s/it(−31%) / ~71GB/卡(降~9GB)**，held-out 仍 10/10（REAL 5.30/NONE 42.71）。
+> 缓存 `.cache/a2v_robotwin/cache_train40_i2v`；cached ckpt `models/train/a2v_robotwin_train40_vace_i2v_cached/step-800.safetensors`。详见 `A2V_HISTORY.md §17`。
+>
 > **Multi-episode I2V-14B 已训练/PASS（2026-06-21，8 卡 DDP）**：train=ep0-39，held-out=ep40-49，105 帧，240x320。
 > final ckpt（全参 vace）：`models/train/a2v_robotwin_train40_vace_i2v/step-800.safetensors`。
 > **held-out：REAL MAE-GT=4.25、NONE=30.09、real<none=10/10、motion ratio=1.06、real-vs-none=30.21，PASS**（比 1.3B 更强、与 train 几乎无 gap）。
@@ -16,6 +20,7 @@
 > held-out REAL=6.25/NONE=26.83/10-10/PASS。详见 `A2V_HISTORY.md §15`。
 >
 > **工具**：`a2v.eval_multiep --base_spec <s> --lora <ckpt> --dataset <heldout> --controls real,none` 多行泛化评测（模型只加载一次、per-row 容错、聚合判定 + metrics.json）。`run_overfit.sh` 支持 `NPROC=`（多卡 DDP）+ `REPEAT/EPOCHS/FRAMES`（多 ep 配方），默认仍是单卡单 ep 过拟合。
+> **encoded-cache**：`--task sft:data_process` 先预编码（每 episode 存 `.pth`），再 `--cache_train --task sft:train --dataset_base_path <cache_dir>` 训练（只载 DiT、跳过编码器）。换分辨率/重渲数据后必须换缓存目录。详见 `A2V_HISTORY.md §17`。
 >
 > **T5 (Wan2.2-TI2V-5B) 已打通/PASS（2026-06-16）**：SEAM-2 新 VAE 路径可用。
 > `wan2.2-ti2v-5b` 已接入：`z_dim=48`、`vae_spatial_factor=16` →
@@ -65,7 +70,8 @@
 > 视频：`.cache/a2v_robotwin/gen_i2v_lr{5e6,1e5,2e5}_s1000_{real,none}.mp4`。
 > 复现/覆盖：`LR=<lr> OUT=<dir> CUDA_VISIBLE_DEVICES=<g> bash a2v/run_overfit.sh wan2.1-i2v-14b-480p`（默认 `LR=1e-5`）。
 >
-> **下一步**：推进 **I2V-14B 多 episode**（复用 `.cache/a2v_robotwin/ep_train40_phys` / `ep_heldout10_phys` 与 `a2v.eval_multiep`，从 `LR=1e-5` 起步）；之后再做 **T6 I2V-A14B**（SEAM-5 双专家：Fun-A14B 的 `vace`/`vace2`、boundary=0.875、分带训练/验证）。见 §15/§4.2/§5。
+> **下一步（择一）**：① **T6 Wan2.2-I2V-A14B**（master plan 最后一个基模，SEAM-5 双专家 MoE：`vace`/`vace2`、boundary=0.875；先做 load/provision/零副作用门，再单样本因果门）；② 更大规模多 ep（更多 episode / 多 task 混训，复用 `eval_multiep`）；③ 进一步降显存（DiT 本体需 ZeRO-3/FSDP 分片）。见 §5/§4.2 与 `A2V_HISTORY.md §15/§16/§17`。
+> **已完成**：T1–T5 单 ep 全 PASS；多 ep 泛化 VACE-1.3B(§15) + I2V-14B(§16) 均 PASS；encoded-cache 提速/降显存(§17)。
 > **勿用的坏产物**：`models/train/a2v_robotwin_ep0_vace_i2v/step-*`（8-bit lr=1e-4 噪声 ckpt）。
 > 其余背景见 `A2V_HISTORY.md` §12（T4 调试史）、§13（06-16 比对 ABot + lr 修复全过程）、§14（T5 终态）。
 

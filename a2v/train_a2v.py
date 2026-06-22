@@ -80,6 +80,11 @@ def main() -> None:
     parser.add_argument("--base_spec", default=None,
                         help="WanBaseSpec name (a2v.base_spec.REGISTRY). Fills model_paths/tokenizer/lora "
                              "defaults and drives the VACE seams. Explicit CLI flags still override.")
+    parser.add_argument("--cache_train", action="store_true",
+                        help="Train from a pre-encoded cache (built with --task sft:data_process). "
+                             "Loads ONLY the DiT (T5/VAE/CLIP outputs come from the cache, so those "
+                             "encoders are not loaded -> big VRAM + time saving) and reads cached .pth "
+                             "tensors via load_from_cache (dataset_base_path = cache dir).")
     # The stock wan_parser defaults --remove_prefix_in_ckpt to "pipe.dit." (a non-None
     # value), which would shadow the spec default below (`is None` never True) and save
     # the VACE LoRA with a "pipe.vace." prefix that infer's load_lora cannot match.
@@ -102,6 +107,16 @@ def main() -> None:
             args.remove_prefix_in_ckpt = spec.vace_remove_prefix
     if args.remove_prefix_in_ckpt is None:
         args.remove_prefix_in_ckpt = "pipe.dit."  # stock default (non-spec usage)
+
+    # --- cache-train: encoders are NOT needed (their outputs are in the cache) ---
+    if args.cache_train:
+        if spec is not None:
+            # model_paths()[0] is the DiT entry (str, or list of shards). Drop T5/VAE/CLIP
+            # so they are never loaded. The from-DiT VACE branch is still built from the DiT
+            # (ensure_vace); for VACE-1.3B the DiT checkpoint also carries the vace weights.
+            args.model_paths = json.dumps([spec.model_paths()[0]])
+        # metadata_path=None -> UnifiedDataset.load_from_cache (recursively finds *.pth)
+        args.dataset_metadata_path = None
 
     height_division_factor = spec.vae_spatial_factor * spec.patch_size[1] if spec is not None else 16
     width_division_factor = spec.vae_spatial_factor * spec.patch_size[2] if spec is not None else 16
@@ -168,7 +183,15 @@ def main() -> None:
     # VACE-1.3B it is the same no-op as T2 (pretrained vace, mask_pq=8). Required for T5
     # (mask_pq=16).
     if spec is not None:
-        provision_a2v(model.pipe, spec)
+        if args.cache_train:
+            # Cache mode: vace_context is already in the cache (encoded with the right mask_pq
+            # at data_process time), and the encoder-side WanVideoUnit_VACE is pruned from
+            # pipe.units for :train. So we only need the vace MODEL (DiT blocks, the trainable
+            # part) — already built by the in-constructor ensure_vace hook; call it again
+            # (idempotent) for clarity. Do NOT install_vace_unit (no encoder unit to swap).
+            ensure_vace(model.pipe, spec)
+        else:
+            provision_a2v(model.pipe, spec)
 
     model_logger = ModelLogger(  # noqa: F405
         args.output_path,
