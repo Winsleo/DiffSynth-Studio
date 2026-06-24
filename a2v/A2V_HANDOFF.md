@@ -7,6 +7,15 @@
 最后更新：2026-06-24（T6 A14B 五基模收官；+ Fun-A14B warm-start 对照 §19）。
 
 > ## ⭐ 接手清单（新会话先读这一段）
+> **🌍 首个正式 A2V World Model PASS（2026-06-24，§20）**：Wan2.2-TI2V-5B、**多任务多机器人、~480p**。
+> 2 任务(adjust_bottle/beat_block_hammer) × 3 机器人(aloha-agilex/franka/ur5) × randomized_500 →
+> **train 2700 / held-out 300**，480×640/49 帧。TI2V VAE 16× → 480×640 与 240×320 I2V 同 30×40 latent（4× 像素、同算量）。
+> encoded-cache 8 卡 DDP、from-DiT 全参 vace、lr1e-5、30 epoch(~10140 步,~7h,~37GB/卡)，ckpt
+> `models/train/a2v_wm_ti2v_480/step-10140.safetensors`。**held-out 门 PASS：12/12（全 6 变体）real<none，REAL MAE-GT 7.24 ≪ NONE 17.35，motion×1.03**；
+> 目视 held-out REAL 复现场景+臂位、NONE 发散。新工具 `a2v/data/build_dataset.sh`（多变体并行建集+合并+validate）、
+> `prepare.py --skip_short`、`run_overfit.sh CACHE_TRAIN/CACHE_DIR/RESUME`。**两个 cache-train 修复**：cache 模式要载 VAE（NoiseInitializer 读 vae 配置）+ 必须 `--task sft:train`（剪掉 T5 等编码器单元）。详见 `A2V_HISTORY.md §20`。
+>
+
 > **🏁 T6 Wan2.2-I2V-A14B PASS（2026-06-22）——五基模全部打通。** master plan 最后一个基模，SEAM-5 双专家 MoE
 > （高噪 `dit`+`vace`、低噪 `dit2`+`vace2`，推理 `switch_DiT_boundary=0.875` 原生切换）。沿用 from-DiT，
 > **两条独立单专家作业**分带训练（high `[0,0.358]`、low `[0.358,1]`，官方配方），新 SEAM-4 变体 `i2v_vae`（input_image

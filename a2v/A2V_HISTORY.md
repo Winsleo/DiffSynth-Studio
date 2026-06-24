@@ -885,3 +885,79 @@ for c in real none shuffle; do CUDA_VISIBLE_DEVICES=0 $PY -m a2v.infer_a2v --bas
 $PY -m a2v.causal_metrics --dataset .cache/a2v_robotwin/ep0_dataset_phys --num_frames 121 \
   --real .cache/a2v_robotwin/gen_funa14b_s1000_real.mp4 --none .cache/a2v_robotwin/gen_funa14b_s1000_none.mp4
 ```
+
+---
+
+## 20. First formal A2V World Model (2026-06-24, TI2V-5B, multi-task, 480p, PASS)
+
+**Result: a multi-task / multi-robot action->video world model that generalizes to held-out
+episodes at 480p.** Base Wan2.2-TI2V-5B, 2 tasks x 3 robots, ~480p, trained on 2700 episodes
+via encoded-cache 8-GPU DDP. Held-out gate PASS: 12/12 (all 6 variants) real<none, REAL motion
+~= GT. This is the move from per-track gates to a production-scale run.
+
+### 20.1 Why this config
+TI2V-5B's Wan2.2 VAE compresses 16x, so 480x640 yields the same 30x40 latent as the validated
+240x320 I2V runs -> 4x the pixels at modest cost, on a cheap 5B single-expert model with a strong
+`ti2v_fused` first frame. (The Fun-A14B comparison in S19 showed the first-frame mechanism dominates
+pixel fidelity, so a strong-first-frame i2v/ti2v base is the right production choice.)
+
+### 20.2 Data (a2v/data/build_dataset.sh, new)
+- 2 tasks (adjust_bottle, beat_block_hammer) x 3 robots (aloha-agilex, franka, ur5) x
+  `randomized_500`. Train eps 0-449, held-out 450-499 per variant -> **2700 train / 300 held-out**.
+- 480x640 (HxW; native 320x240 -> exact 2x, aspect preserved), 49 frames. Episode lengths vary by
+  robot (aloha 110-216, franka 67-119, ur5 64-104), so 49 frames fits all; `prepare.py --skip_short`
+  (new) drops any rare too-short episode instead of aborting. 0 skipped here.
+- Cross-embodiment overlay gate first (S7's TCP / gripper_z_offset=0 convention was only verified on
+  aloha): rendered 1 ep/robot with --write_overlay; the trajectory frame tracks the end-effector for
+  all 3 robots. Build is parallel (12 variants) + merged (paths prefixed by variant subdir so one
+  dataset_base_path resolves every row) + validated. ~231GB train PNGs.
+
+### 20.3 Pre-encode + train (encoded-cache, S17 path)
+- Pre-encode once, 8-GPU sharded `--task sft:data_process` -> `cache_wm_ti2v_480` (~377GB; the cache
+  also stores raw inputs alongside the encoded tensors, hence large).
+- Train `run_overfit.sh` (extended with `CACHE_TRAIN=/CACHE_DIR=/RESUME=`): 8-GPU DDP cache-train,
+  from-DiT full-param vace, 8-bit Adam, lr 1e-5, 30 epochs (~10140 steps), save_steps 500, ~37GB/GPU,
+  ~2.1s/it (~7h). Loss 0.49 -> last100 mean 0.13 (diverse set; not single-sample memorization).
+  ckpt `models/train/a2v_wm_ti2v_480/step-10140.safetensors` (5.2GB, from-DiT vace).
+- **Two cache-train fixes (TI2V-specific vs the I2V cache path in S17):**
+  (1) `WanVideoUnit_NoiseInitializer` reads `pipe.vae.model.z_dim`/`upsampling_factor`, so cache-train
+  must keep the (small) VAE loaded, not only the DiT (`train_a2v` now loads DiT+VAE in cache mode).
+  (2) the encoder units only prune when the task ends `:train`; `run_overfit.sh` cache mode passes
+  `--task sft:train` (the default `sft` left the T5 text-encoder unit running against a None encoder).
+
+### 20.4 Held-out gate (eval_multiep, 2 rows/variant = 12 rows, step-10140)
+| set | mean REAL MAE-GT | mean NONE MAE-GT | real<none | motion ratio | real-vs-none |
+| --- | --- | --- | --- | --- | --- |
+| held-out (all 6 variants) | **7.24** | 17.35 | **12/12** | 1.03 | 16.07 |
+- Every variant (both tasks x all 3 robots) passes; REAL motion 3.25 ~= GT 3.18; failed 0/12.
+- Visual spot-check (held-out beat_block_hammer/aloha ep450): REAL reproduces the GT scene + arm pose;
+  NONE keeps the scene (ti2v first frame) but the arm diverges -> causal control confirmed on unseen eps.
+- MAE 7.24 is higher than single-task gates (T5 5.27 / I2V multi-ep 4.25) and the real<none separation
+  is ~2.4x (vs ~5-8x single-task): expected for 6 variants x 480p x 49 frames. Strong + uniform signal.
+  Products: `.cache/a2v_robotwin/eval_wm_heldout/` (mp4 + metrics.json).
+
+### 20.5 Reproduce
+```bash
+bash a2v/data/build_dataset.sh                 # 2 tasks x 3 robots, 480x640/49f -> wm_480_{train,heldout}
+D=.cache/a2v_robotwin/wm_480_train
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 .venv/bin/accelerate launch --num_processes 8 --mixed_precision bf16 \
+  -m a2v.train_a2v --base_spec wan2.2-ti2v-5b --task sft:data_process \
+  --dataset_base_path "$D" --dataset_metadata_path "$D/metadata.jsonl" \
+  --data_file_keys video,vace_video --extra_inputs vace_video,input_image \
+  --height 480 --width 640 --num_frames 49 --dataset_repeat 1 \
+  --output_path .cache/a2v_robotwin/cache_wm_ti2v_480
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 SPEC=wan2.2-ti2v-5b CACHE_TRAIN=1 \
+  CACHE_DIR=.cache/a2v_robotwin/cache_wm_ti2v_480 NPROC=8 HEIGHT=480 WIDTH=640 FRAMES=49 \
+  LR=1e-5 REPEAT=1 EPOCHS=30 SAVE_STEPS=500 OUT=models/train/a2v_wm_ti2v_480 \
+  bash a2v/run_overfit.sh wan2.2-ti2v-5b
+CK=models/train/a2v_wm_ti2v_480/step-10140.safetensors
+CUDA_VISIBLE_DEVICES=0 .venv/bin/python -m a2v.eval_multiep --base_spec wan2.2-ti2v-5b --lora $CK \
+  --dataset .cache/a2v_robotwin/wm_480_heldout --rows 0,1,50,51,100,101,150,151,200,201,250,251 \
+  --num_frames 49 --height 480 --width 640 --controls real,none --output_dir .cache/a2v_robotwin/eval_wm_heldout
+```
+
+### 20.6 Next (v2 directions)
+- More steps / lr warmup+cosine (trainer is constant-lr; loss was still trending down).
+- Scale robots/tasks (add arx-x5/piper; unpack more RoboTwin tasks) and longer clips (aloha-only or
+  longer-episode tasks support >49 frames).
+- Full 300-row held-out sweep for a tighter metric; quantitative video-quality metrics (EZS-Bench style).
