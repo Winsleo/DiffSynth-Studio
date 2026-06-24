@@ -101,7 +101,10 @@ def _mean(values: Iterable[float]) -> float:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base_spec", required=True)
-    parser.add_argument("--lora", required=True)
+    parser.add_argument("--lora", required=True,
+                        help="VACE ckpt (HIGH-noise expert for dual-expert specs).")
+    parser.add_argument("--lora_low", default=None,
+                        help="Low-noise expert VACE ckpt (required for dual-expert specs).")
     parser.add_argument("--lora_alpha", type=float, default=1.0)
     parser.add_argument("--dataset", required=True)
     parser.add_argument("--rows", default=None, help="Comma/range row selector, e.g. 0,1,2 or 0-4. Default: all rows.")
@@ -127,8 +130,9 @@ def main() -> None:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"Loading model once: base_spec={args.base_spec} lora={args.lora}")
-    pipe, spec = build_pipe_with_vace(args.base_spec, args.lora, args.lora_alpha)
+    print(f"Loading model once: base_spec={args.base_spec} lora={args.lora} lora_low={args.lora_low}")
+    pipe, spec = build_pipe_with_vace(args.base_spec, args.lora, args.lora_alpha,
+                                      ckpt_path_low=args.lora_low)
 
     records = []
     failures = []

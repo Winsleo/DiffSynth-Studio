@@ -32,7 +32,7 @@ from diffsynth.pipelines.wan_video import WanVideoPipeline, ModelConfig
 from diffsynth.utils.data import save_video
 
 from a2v.base_spec import get_spec
-from a2v.provision import provision_a2v
+from a2v.provision import build_bare_vace, provision_a2v
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -94,17 +94,68 @@ def load_frames(dataset: Path, rel_paths: list[str]) -> list[Image.Image]:
     return [Image.open(dataset / p).convert("RGB") for p in rel_paths]
 
 
-def build_pipe_with_vace(base_spec: str, ckpt_path: str, lora_alpha: float = 1.0):
-    """Build a WanVideoPipeline, provision A2V seams, and load trained VACE weights."""
+def build_pipe_with_vace(base_spec: str, ckpt_path: str, lora_alpha: float = 1.0,
+                         ckpt_path_low: str | None = None):
+    """Build a WanVideoPipeline, provision A2V seams, and load trained VACE weights.
+
+    Single-expert specs: `ckpt_path` is loaded into the one VACE branch.
+    Dual-expert specs (SEAM-5 A14B): both DiT experts are loaded, vace + vace2 are built
+    from-DiT, the HIGH-noise ckpt (`ckpt_path`) goes into `pipe.vace`, and the LOW-noise
+    ckpt (`ckpt_path_low`, required) into `pipe.vace2`. DiffSynth's native expert switch
+    (switch_DiT_boundary, default == spec.switch_boundary) routes per timestep at inference.
+    """
     spec = get_spec(base_spec)
+    # Dual-expert (A14B) loads BOTH 14B DiTs at once; even with the native switch keeping
+    # one active, two resident experts + activations exceed 80GB. Enable CPU offload so the
+    # inactive expert streams to CPU (active expert + the post-hoc from-DiT VACE branches
+    # stay on GPU). Single-expert specs keep the all-on-GPU path (unchanged).
+    from_kwargs = {}
+    if spec.experts:
+        vram_config = {
+            "offload_dtype": torch.bfloat16, "offload_device": "cpu",
+            "onload_dtype": torch.bfloat16, "onload_device": "cuda",
+            "preparing_dtype": torch.bfloat16, "preparing_device": "cuda",
+            "computation_dtype": torch.bfloat16, "computation_device": "cuda",
+        }
+        model_configs = [ModelConfig(path=p, **vram_config) for p in spec.model_paths()]
+        # leave headroom for the two unmanaged VACE branches (~12GB) + activations
+        from_kwargs["vram_limit"] = torch.cuda.mem_get_info("cuda")[1] / (1024 ** 3) - 16
+    else:
+        model_configs = [ModelConfig(path=p) for p in spec.model_paths()]
     pipe = WanVideoPipeline.from_pretrained(
         torch_dtype=torch.bfloat16,
         device="cuda",
-        model_configs=[ModelConfig(path=p) for p in spec.model_paths()],
+        model_configs=model_configs,
         tokenizer_config=ModelConfig(spec.abs_tokenizer_path()),
+        **from_kwargs,
     )
     vace = provision_a2v(pipe, spec)
-    _load_vace_weights(pipe, vace, ckpt_path, lora_alpha)
+    if spec.experts:
+        if ckpt_path_low is None:
+            raise ValueError(
+                f"{spec.name} is a dual-expert MoE; pass the low-noise checkpoint via "
+                "--lora_low (high-noise -> --lora)."
+            )
+        dev = pipe.device
+        if spec.has_pretrained_vace:
+            # Pretrained (Wan2.2-VACE-Fun-A14B): from_pretrained's vace/vace2 are vram-managed
+            # (wrapped -> `.module.` state_dict keys), which a standard vace checkpoint can't
+            # load into. We only need the TRAINED weights, so build fresh plain GPU-resident
+            # branches and load the ckpts (same end-state as the from-DiT path: un-managed
+            # vace pinned on GPU while the native switch offloads the inactive DiT).
+            hii = bool(getattr(pipe.dit, "has_image_input", False))
+            pipe.vace = build_bare_vace(spec, has_image_input=hii, dtype=pipe.torch_dtype, device=dev)
+            pipe.vace2 = build_bare_vace(spec, has_image_input=hii, dtype=pipe.torch_dtype, device=dev)
+        else:
+            # from-DiT VACE branches (Wan2.2-I2V-A14B) are built post-hoc from possibly-
+            # offloaded (cpu) DiTs and are NOT vram-managed -> pin them to the compute device.
+            pipe.vace = pipe.vace.to(dev)
+            pipe.vace2 = pipe.vace2.to(dev)
+        vace = pipe.vace
+        _load_vace_weights(pipe, pipe.vace, ckpt_path, lora_alpha)
+        _load_vace_weights(pipe, pipe.vace2, ckpt_path_low, lora_alpha)
+    else:
+        _load_vace_weights(pipe, vace, ckpt_path, lora_alpha)
     return pipe, spec
 
 
@@ -127,7 +178,7 @@ def first_frame_kwargs(spec, ref: Image.Image) -> dict:
     # These are alternatives, not additive: native first-frame paths already inject frame 0,
     # so we do NOT also pass vace_reference_image there. The causal control (real vs none)
     # still lives entirely in vace_video.
-    if spec.first_frame_mode in ("i2v_concat", "ti2v_fused"):
+    if spec.first_frame_mode in ("i2v_concat", "i2v_vae", "ti2v_fused"):
         return {"input_image": ref}
     return {"vace_reference_image": ref}
 
@@ -155,7 +206,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset", required=True)
     parser.add_argument("--base_spec", default="wan2.1-vace-1.3b", help="WanBaseSpec name (a2v.base_spec.REGISTRY).")
-    parser.add_argument("--lora", required=True, help="Trained VACE LoRA safetensors.")
+    parser.add_argument("--lora", required=True,
+                        help="Trained VACE checkpoint. For a dual-expert spec this is the "
+                             "HIGH-noise expert ckpt (pair with --lora_low).")
+    parser.add_argument("--lora_low", default=None,
+                        help="Low-noise expert VACE ckpt (required for dual-expert specs).")
     parser.add_argument("--lora_alpha", type=float, default=1.0)
     parser.add_argument("--row", type=int, default=0)
     parser.add_argument("--num_frames", type=int, default=121)
@@ -170,7 +225,8 @@ def main() -> None:
 
     dataset = Path(args.dataset).resolve()
     row = load_row(dataset, args.row)
-    pipe, spec = build_pipe_with_vace(args.base_spec, args.lora, args.lora_alpha)
+    pipe, spec = build_pipe_with_vace(args.base_spec, args.lora, args.lora_alpha,
+                                      ckpt_path_low=args.lora_low)
     video = generate_one(
         pipe=pipe,
         spec=spec,

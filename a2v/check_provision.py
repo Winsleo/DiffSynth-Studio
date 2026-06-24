@@ -106,8 +106,14 @@ def gate_shape(pipe, spec) -> None:
 
 def gate_zero_side_effect(pipe, spec, vace_video, first_frame, args) -> None:
     print("\n=== Gate (2): ZERO SIDE-EFFECT (real pipe(), with vs without control) ===")
-    # provision the zero-init branch + the mask_pq unit (fresh; sets idempotency marker)
+    # provision the zero-init branch + the mask_pq unit (fresh; sets idempotency marker).
+    # For a dual-expert spec this builds BOTH vace and vace2 (each after_proj=0); the native
+    # switch_DiT_boundary exercises both across the inference steps, so the bit-identical
+    # check below covers both experts' zero-init in one run.
     provision_a2v(pipe, spec)
+    if spec.experts:
+        assert getattr(pipe, "vace2", None) is not None, "dual spec: vace2 not provisioned"
+        print(f"  dual-expert: vace + vace2 provisioned (switch_boundary={spec.switch_boundary})")
 
     common = dict(
         prompt="robot arm manipulation",
@@ -119,7 +125,7 @@ def gate_zero_side_effect(pipe, spec, vace_video, first_frame, args) -> None:
     # CLIP/VAE-concat conditioning; TI2V writes the encoded first image into latent frame
     # 0. The first frame is held FIXED (conditioning, not the control under test); only
     # vace_video toggles. For non-native-first-frame bases no first frame is added here.
-    if spec.first_frame_mode in ("i2v_concat", "ti2v_fused"):
+    if spec.first_frame_mode in ("i2v_concat", "i2v_vae", "ti2v_fused"):
         common["input_image"] = first_frame
 
     def _arr(frames):

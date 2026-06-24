@@ -80,6 +80,11 @@ def main() -> None:
     parser.add_argument("--base_spec", default=None,
                         help="WanBaseSpec name (a2v.base_spec.REGISTRY). Fills model_paths/tokenizer/lora "
                              "defaults and drives the VACE seams. Explicit CLI flags still override.")
+    parser.add_argument("--expert", default=None, choices=("high", "low"),
+                        help="SEAM-5 dual-expert MoE (A14B): which expert this job trains. "
+                             "Selects that expert's DiT via spec.model_paths(expert=...) and "
+                             "should be paired with the matching --min/--max_timestep_boundary "
+                             "band (see run_overfit.sh). Ignored for single-expert specs.")
     parser.add_argument("--cache_train", action="store_true",
                         help="Train from a pre-encoded cache (built with --task sft:data_process). "
                              "Loads ONLY the DiT (T5/VAE/CLIP outputs come from the cache, so those "
@@ -97,7 +102,8 @@ def main() -> None:
     spec = get_spec(args.base_spec) if args.base_spec else None
     if spec is not None:
         if args.model_paths is None and args.model_id_with_origin_paths is None:
-            args.model_paths = json.dumps(spec.model_paths())
+            # SEAM-5: --expert selects one MoE expert's DiT (single-DiT training job).
+            args.model_paths = json.dumps(spec.model_paths(expert=args.expert))
         if args.tokenizer_path is None:
             args.tokenizer_path = spec.abs_tokenizer_path()
         if args.lora_base_model is None and args.trainable_models is None:
@@ -114,7 +120,7 @@ def main() -> None:
             # model_paths()[0] is the DiT entry (str, or list of shards). Drop T5/VAE/CLIP
             # so they are never loaded. The from-DiT VACE branch is still built from the DiT
             # (ensure_vace); for VACE-1.3B the DiT checkpoint also carries the vace weights.
-            args.model_paths = json.dumps([spec.model_paths()[0]])
+            args.model_paths = json.dumps([spec.model_paths(expert=args.expert)[0]])
         # metadata_path=None -> UnifiedDataset.load_from_cache (recursively finds *.pth)
         args.dataset_metadata_path = None
 
