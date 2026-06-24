@@ -4,9 +4,30 @@
 > 这件事的目标、已核实事实、已产出文档、当前代码状态、以及待办与阻塞点。
 > 详细内容散在 `.cache/analysis/` 的各专题文档里，本文给出索引与摘要。
 
-最后更新：2026-06-22。
+最后更新：2026-06-24（T6 A14B 五基模收官；+ Fun-A14B warm-start 对照 §19）。
 
 > ## ⭐ 接手清单（新会话先读这一段）
+> **🏁 T6 Wan2.2-I2V-A14B PASS（2026-06-22）——五基模全部打通。** master plan 最后一个基模，SEAM-5 双专家 MoE
+> （高噪 `dit`+`vace`、低噪 `dit2`+`vace2`，推理 `switch_DiT_boundary=0.875` 原生切换）。沿用 from-DiT，
+> **两条独立单专家作业**分带训练（high `[0,0.358]`、low `[0.358,1]`，官方配方），新 SEAM-4 变体 `i2v_vae`（input_image
+> 走 VAE-concat，**无 CLIP**）。只下载两套 DiT 专家分片（107GB；VAE/T5/tokenizer 复用 converted）。
+> 单样本因果门 **REAL MAE-GT=3.14（五基模最佳）**、motion 4.97≈GT 4.78、NONE 21.48/SHUFFLE 20.48、切换不撕裂。
+> ckpt：`models/train/a2v_robotwin_ep0_vace_a14b_{high,low}/step-1000.safetensors`。
+> 配方：`EXPERT=high|low CUDA_VISIBLE_DEVICES=<g> bash a2v/run_overfit.sh wan2.2-i2v-a14b`（跑两次）；
+> 推理：`a2v.infer_a2v --base_spec wan2.2-i2v-a14b --lora <high> --lora_low <low>`（双专家自动开 CPU offload）。详见 `A2V_HISTORY.md §18`。
+>
+> **Warm-start 对照 PASS（2026-06-24，§19）**：`PAI/Wan2.2-VACE-Fun-A14B` 自带预训练双 VACE（in_dim16 T2V 式 DiT +
+> `vace_reference`，结构==VACE-14B hash 7a513e → 直接探测，has_pretrained_vace=True，只下两份 noise_model ~69GB）。
+> 同 T6 配方单 ep 训练。**两路都 PASS，但 T6 from-DiT I2V-A14B（REAL MAE-GT 3.14）≫ Fun-A14B warm-start（6.45）**——
+> 主导因素是**首帧机制**（i2v_vae 强锚定 vs vace_reference 弱），非 VACE 初始化；warm-start 起始 loss 低（0.024 vs 1.49）但赢不回弱首帧的像素差距。
+> 生产取舍：i2v_vae 首帧 > warm-start，**T6 from-DiT 仍是更优生产选择**。ckpt `…_vace_funa14b_{high,low}/step-1000`。
+> infer 修复：预训练 vace 受 vram 管理（键带 `.module.`）→ 推理改 `build_bare_vace` 建裸分支载训练 ckpt。详见 `A2V_HISTORY.md §19`。
+>
+> **A14B 多 episode 泛化 PASS（2026-06-22，encoded-cache 双专家，§18.6）**：train40/heldout10（240×320/105 帧），
+> 两专家**共享一份 cache**（一次预编码、各 8 卡 DDP cache-train 800 步、~65GB/卡）。held-out 10 ep：**REAL MAE-GT 5.36
+> ≪ NONE 56.72、real<none 10/10、motion ratio 1.05、failed 0**；held-out(5.36)≤train(5.60) 真泛化。
+> ckpt `models/train/a2v_robotwin_train40_vace_a14b_{high,low}_cached/step-800.safetensors`；cache `.cache/a2v_robotwin/cache_train40_a14b`。
+>
 > **Encoded-cache 提速/降显存 PASS（2026-06-22）**：stock DiffSynth 自带 `:data_process`→`load_from_cache`，加 `--cache_train`
 > 即可只载 DiT、跳过 T5/VAE/CLIP。I2V-14B 多 ep cache-train **6.96s/it(−31%) / ~71GB/卡(降~9GB)**，held-out 仍 10/10（REAL 5.30/NONE 42.71）。
 > 缓存 `.cache/a2v_robotwin/cache_train40_i2v`；cached ckpt `models/train/a2v_robotwin_train40_vace_i2v_cached/step-800.safetensors`。详见 `A2V_HISTORY.md §17`。
@@ -70,8 +91,8 @@
 > 视频：`.cache/a2v_robotwin/gen_i2v_lr{5e6,1e5,2e5}_s1000_{real,none}.mp4`。
 > 复现/覆盖：`LR=<lr> OUT=<dir> CUDA_VISIBLE_DEVICES=<g> bash a2v/run_overfit.sh wan2.1-i2v-14b-480p`（默认 `LR=1e-5`）。
 >
-> **下一步（择一）**：① **T6 Wan2.2-I2V-A14B**（master plan 最后一个基模，SEAM-5 双专家 MoE：`vace`/`vace2`、boundary=0.875；先做 load/provision/零副作用门，再单样本因果门）；② 更大规模多 ep（更多 episode / 多 task 混训，复用 `eval_multiep`）；③ 进一步降显存（DiT 本体需 ZeRO-3/FSDP 分片）。见 §5/§4.2 与 `A2V_HISTORY.md §15/§16/§17`。
-> **已完成**：T1–T5 单 ep 全 PASS；多 ep 泛化 VACE-1.3B(§15) + I2V-14B(§16) 均 PASS；encoded-cache 提速/降显存(§17)。
+> **下一步（择一，T6 后；master plan 五基模已收官）**：① **A14B 多 episode 泛化**（复用 `eval_multiep --lora_low`、train40/heldout10、encoded-cache）；② 更大规模多 ep（更多 episode / 多 task 混训）；③ `Wan2.2-VACE-Fun-A14B` 自带双 VACE warm-start 对照；④ 编码升级（splat）；⑤ 进一步降显存（DiT 本体需 ZeRO-3/FSDP 分片）。见 §5/§4.2 与 `A2V_HISTORY.md §15/§16/§17/§18`。
+> **已完成**：**T1–T6 单 ep 全 PASS（五基模收官）**；多 ep 泛化 VACE-1.3B(§15) + I2V-14B(§16) 均 PASS；encoded-cache 提速/降显存(§17)；T6 A14B 双专家 MoE(§18)。
 > **勿用的坏产物**：`models/train/a2v_robotwin_ep0_vace_i2v/step-*`（8-bit lr=1e-4 噪声 ckpt）。
 > 其余背景见 `A2V_HISTORY.md` §12（T4 调试史）、§13（06-16 比对 ABot + lr 修复全过程）、§14（T5 终态）。
 
@@ -164,7 +185,7 @@ P=Q **必须等于 VAE 空间压缩因子**（否则崩）——这是 master pl
 | `data/validate.py` | 用 UnifiedDataset 校验产出；支持 `--base_spec` 派生 T5 的 32×空间整除 |
 | `data/smoke.py` | 端到端 smoke（合成数据 prepare+validate） |
 | `data/robotwin_adapter.py` | **[T1]** RoboTwin hdf5 → actions/intrinsic/extrinsic.npy + manifest（§7） |
-| `base_spec.py` | **[T2/T3/T4/T5]** `WanBaseSpec`+`REGISTRY`+`get_spec`；含 `wan2.2-ti2v-5b`(352/16,§14) |
+| `base_spec.py` | **[T2/T3/T4/T5/T6]** `WanBaseSpec`+`REGISTRY`+`get_spec`；含 `wan2.2-ti2v-5b`(352/16,§14)、`wan2.2-i2v-a14b`(双专家 MoE：`experts/expert_dit_globs/switch_boundary/train_bands`、`first_frame_mode=i2v_vae`、`model_paths(expert=)`，§18) 与 `wan2.2-vace-fun-a14b`(预训练双 VACE warm-start：has_pretrained_vace=True、in_dim16、`first_frame_mode=vace_reference`，§19) |
 | `vace_unit.py` | **[T2]** `ParamWanVideoUnit_VACE`(参数化 mask_pq)+`install_vace_unit`(§8) |
 | `provision.py` | **[T2/T3]** `ensure_vace`(SEAM-1,幂等)+`provision_a2v`+`create_vace_from_dit`(从 DiT 造 VACE,只 zero-init after_proj,§11) |
 | `check_provision.py` | **[T3/T4/T5]** SEAM-1 退出门:形状/零副作用/结构 parity(§11);I2V/TI2V 传 `input_image`(§12/§14) |
@@ -193,6 +214,9 @@ P=Q **必须等于 VAE 空间压缩因子**（否则崩）——这是 master pl
 | **T4 接入 I2V-14B** | ✅ **PASS/定稿** (06-16) | 真因=**lr 1e-4 过高**(非 8-bit Adam/非缺 vace_reference)。三组 step-1000 lr 扫描完成，**lr1e5 胜出**:REAL MAE-GT **4.83**、motion 4.94≈GT 4.78、NONE MAE-GT 36.04、real-none 36.79。`run_overfit.sh` 默认已改 `1e-5`。详见 §12/§13 |
 | **T5 接入 TI2V-5B** | ✅ **PASS** (06-16) | SEAM-2 新 VAE 打通：`vace_in_dim=352`/`mask_pq=16`，256×320 数据、load/provision/1000步过拟合/real-none-shuffle 因果门全过。REAL MAE-GT **5.27**，NONE 15.62，SHUFFLE 14.91。详见 §14 |
 | **M1 VACE-1.3B 多 episode** | ✅ **PASS** (06-18) | train40/heldout10，105 帧，240x320，LoRA step-4800。held-out REAL MAE-GT **6.25** vs NONE **26.83**，real<none **10/10**，motion ratio **1.03**。详见 §15 |
+| **T6 接入 I2V-A14B** | ✅ **PASS** (06-22) | SEAM-5 双专家 MoE。两条独立单专家作业分带训练（high `[0,0.358]`/low `[0.358,1]`），新 SEAM-4 `i2v_vae`(无 CLIP)，from-DiT 全参 vace。推理原生切换(0.875)+双专家 CPU offload。单 ep 因果门 **REAL MAE-GT 3.14**(五基模最佳)/NONE 21.48/SHUFFLE 20.48/motion×1.04/不撕裂。详见 §18 |
+| **M2 A14B 多 episode** | ✅ **PASS** (06-22) | encoded-cache 双专家（共享 cache，各 8 卡 DDP 800 步，~65GB/卡）。held-out ep40-49 **REAL MAE-GT 5.36 ≪ NONE 56.72，real<none 10/10，ratio 1.05**，held-out≤train 真泛化。详见 §18.6 |
+| **C1 Fun-A14B warm-start 对照** | ✅ **PASS** (06-24) | 预训练双 VACE（in_dim16/vace_reference）vs T6 from-DiT。两路都 PASS，但 **T6 REAL 3.14 ≫ Fun 6.45**；主导因素=首帧机制(i2v_vae vs vace_reference)，非 VACE 初始化。详见 §19 |
 
 **环境（已解决,不要再找）**：venv 在 `/vepfs/wangshilong/code/DiffSynth-Studio/.venv`。
 `.venv/bin/python` 已含 torch 2.5.1+cu121 / numpy / einops / PIL / imageio / **h5py / tensorboard**。
@@ -237,7 +261,7 @@ T2 抽象插入(走 spec, 对拍T1) → 抽象=零行为变更           ✅ PAS
 T3 T2V-1.3B   → SEAM-1 (从DiT造VACE)                  ✅ PASS (§11)
 T4 I2V-14B    → SEAM-4(i2v)+scale (有 ABot 参考可 warm-start)  ✅ PASS (§13)
 T5 TI2V-5B    → SEAM-2 (新VAE 352/16)                    ✅ PASS (§14)
-T6 A14B       → SEAM-5 (双专家MoE)                       ← 下一步
+T6 A14B       → SEAM-5 (双专家MoE) + SEAM-4 i2v_vae(无CLIP) ✅ PASS (§18)
 ```
 
 ### 4.3 对齐不变量（正确性核心）
@@ -249,18 +273,17 @@ T6 A14B       → SEAM-5 (双专家MoE)                       ← 下一步
 
 ## 5. 下一步待办（建议顺序）
 
-T1、T2、T3、T4、T5 已 PASS（见 §7/§8/§11/§13/§14）。接下来：
+**T1–T6 全 PASS（五基模收官，见 §7/§8/§11/§13/§14/§18）。多 ep 泛化：VACE-1.3B(§15)/I2V-14B(§16)/A14B(§18.6) 均 PASS。** 接下来（择一）：
 
-1. **T6 接入 Wan2.2-I2V-A14B**（新变量 SEAM-5 双专家 MoE）：
-   - 目标是 Fun-A14B 的双 VACE 专家（`vace`/`vace2`、boundary=0.875）。先只做加载/provision 门，再做单样本过拟合因果门。
-   - 保持 T3/T4/T5 的原则：新增基模先 spec 化；from-DiT/新分支全参训；只 zero-init 回主流的 `after_proj`；I2V 首帧走 `input_image`。
-   - 退出门建议沿用 T5：load smoke、provision shape/零副作用、1000 步单样本 overfit、real/none/shuffle 因果门。
-2. **多 episode 泛化**（可先在 T4/T5 做）：adapter 已支持 `--episodes_range`/默认全 episode；prepare 支持多行 manifest。14B 多 episode 前优先考虑 encoded-cache，避免重复 T5/CLIP/VAE 编码。
-3. **编码升级**（不依赖 ABot ckpt）：按 `A2V_action_encoding_redesign.md` 实现 Tier1 splat 编码，作为 `prepare.py` 的 `--encoding splat` 选项，与现编码过拟合对拍。
+1. **更大规模多 episode**：更多 episode / 多 task 混训（14B/A14B 用 encoded-cache 避免重复编码；A14B 双专家共享一份 cache）。
+2. **编码升级**（不依赖 ABot ckpt）：按 `A2V_action_encoding_redesign.md` 实现 Tier1 splat 编码，作为 `prepare.py` 的 `--encoding splat` 选项，与现编码过拟合对拍。
+3. **DPO / EZS-Bench**（ABot 参考，§13.3）：量化评测替代目视、物理偏好精修。
+4. （可选）Fun-A14B warm-start 多 ep（§19 已做单 ep 对照，结论：首帧机制主导，预计多 ep 模式不变）。
 
 ### 已完成但常被误判的分支
 - T4 I2V-14B 已 PASS；坏的是旧 `models/train/a2v_robotwin_ep0_vace_i2v/step-*`（lr=1e-4 发散），可用的是 `..._lr1e5/step-1000.safetensors`。
 - T5 TI2V-5B 已 PASS；`vace_unit.py` 的 `mask_pq=16` 路径已实测，不再是待办。
+- T6 A14B 已 PASS；双专家是**两条独立单专家作业**（非一个作业训两专家），推理才合并；A14B I2V **无 CLIP**（`i2v_vae`），别误加 image_encoder。
 
 ---
 

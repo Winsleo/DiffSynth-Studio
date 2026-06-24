@@ -43,6 +43,12 @@
 > **2026-06-16 进展（T5 TI2V-5B PASS）**：接入 Wan2.2-TI2V-5B（SEAM-2 新 VAE），`vace_in_dim=352`/`mask_pq=16`
 > 由 spec 自动派生；训练/推理首帧走 `ti2v_fused → input_image`。256×320 数据、T5 load smoke、provision 零副作用门、1000 步全参 vace 过拟合、
 > real/none/shuffle 因果门均完成：REAL MAE-GT=5.27，NONE=15.62，SHUFFLE=14.91，T5 PASS。用户同意后已卸载 deepspeed，a2v run 不再需要 stub-nvcc。详见 §14。
+>
+> **2026-06-22 进展（T6 Wan2.2-I2V-A14B PASS，五基模收官）**：接入最后一个基模——双专家 MoE（SEAM-5）。
+> DiffSynth 原生支持双专家（`dit/dit2`+`vace/vace2`，推理 `switch_DiT_boundary=0.875` 自动切换）；沿用 from-DiT，
+> **两条独立单专家作业**分带训练（high `[0,0.358]`、low `[0.358,1]`，官方配方）。新 SEAM-4 变体 `i2v_vae`（input_image
+> 走 VAE-concat，无 CLIP）。只下载两套 DiT 专家分片（107GB，VAE/T5/tokenizer 复用）。load/provision/双专家过拟合/合并因果门全过：
+> **REAL MAE-GT=3.14（五基模最佳）**、motion 4.97≈GT 4.78、NONE 21.48/SHUFFLE 20.48，real≪负对照、切换不撕裂。详见 §18。
 
 ---
 
@@ -655,3 +661,227 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 .venv/bin/accelerate launch --num_processes
 - 数据并行顺序：cache 的 `.pth` 按文件 glob 顺序被发现（非按 episode 号），DDP 分片与 metadata 顺序不同——结果等价但非逐位复现。
 - 显存进一步：编码器已不占（省 ~9GB/卡），DiT 本体 + 激活仍是大头；要再降需模型分片（ZeRO-3/FSDP）或更激进的 grad-ckpt。
 - 适用面：多 ep / 多 epoch 训练收益最大（一次编码、多轮复用）；单 ep 单轮过拟合收益小（编码只省一遍）。
+
+---
+
+## 18. T6 接入 Wan2.2-I2V-A14B（2026-06-22，SEAM-5 双专家 MoE，PASS）
+
+**结论：master plan 最后一个基模打通，五基模全部 PASS。** Wan2.2-I2V-A14B 是双专家 MoE：
+高噪专家 `dit`+`vace`、低噪专家 `dit2`+`vace2`，推理按 timestep 用 DiffSynth **原生切换**
+（`switch_DiT_boundary=0.875`）。沿用 from-DiT 原则（与 T3/T4/T5 同构，唯一新变量=SEAM-5），
+**两条独立单专家作业**分带训练，推理合并。单样本因果门 **REAL MAE-GT=3.14**（五基模最佳）。
+
+### 18.1 关键事实（都查过实际代码）
+- **DiffSynth 原生支持双专家**：`wan_video.py:151-163` 用 `fetch_model(...,index=2)` 把两套权重装进
+  `pipe.dit`/`pipe.dit2`、`pipe.vace`/`pipe.vace2`；`wan_video.py:314-317` 在 `timestep < switch_DiT_boundary*1000`
+  时把 `models["dit"]=dit2`/`models["vace"]=vace2`。**不改 `diffsynth/`。**
+- **官方配方=两条独立单专家作业**（`examples/wanvideo/model_training/full/Wan2.2-I2V-A14B.sh`、
+  `…VACE-Fun-A14B.sh`）：high 训 `--max_timestep_boundary 0.358 --min 0`（timesteps[900,1000]），
+  low 训 `--max 1 --min 0.358`（timesteps[0,900)）。stock loss 已按这两个 flag 截断采样带
+  （`diffsynth/diffusion/loss.py:11-14,37-40`），`train_a2v` 早已透传。每条作业只载**一个** 14B 专家
+  → 训练显存=T4。
+- **A14B I2V 无 CLIP**：config（`model_configs.py:281`）`has_image_input=False, in_dim=36,
+  require_clip_embedding=False`。首帧走 VAE-concat `y`（`WanVideoUnit_ImageEmbedderVAE`，gated on
+  `require_vae_embedding`），CLIP 单元自动 no-op（`require_clip_embedding=False`）→ 新 SEAM-4 变体
+  `i2v_vae`（input_image，但不载 image encoder）。
+- **VAE/T5/tokenizer 与已有资产同**：Wan2.1 VAE（z16/s8 → vace_in_dim=96、mask_pq=8）、umt5-xxl T5、
+  umt5 tokenizer，全部复用；DiT 结构==I2V-14B（5120/40/40/13824）、`vace_layers=(0,5,…,35)`。
+  **只下载两套 DiT 专家分片**（各 6 片，共 107GB，`models/Wan-AI/Wan2.2-I2V-A14B/{high,low}_noise_model/`）。
+
+### 18.2 代码改动（均限 `a2v/`）
+- `base_spec.py`：新 `first_frame_mode="i2v_vae"`；新双专家字段 `experts/expert_dit_globs/switch_boundary/train_bands`；
+  `model_paths(expert=None)`（`expert="high|low"`→单专家 DiT；`None`→两专家[high,low]→`dit,dit2`）；
+  注册 `wan2.2-i2v-a14b`。
+- `provision.py`：`create_vace_from_dit(pipe, spec, dit=None)`（可指定源 DiT，从 `dit2` 造 `vace2`）；
+  新 `ensure_vace_experts`（两 DiT 都在时建两分支）；`provision_a2v` 双专家时建 vace+vace2。
+- `train_a2v.py`：加 `--expert {high,low}`，选该专家 DiT。其余=T4（from-DiT 全参 vace、8-bit Adam、lr1e-5）。
+- `infer_a2v.py`：`build_pipe_with_vace(..., ckpt_path_low=)` 双专家路径（两 DiT、vace+vace2、high/low ckpt）；
+  `first_frame_kwargs` 加 `i2v_vae→input_image`；CLI 加 `--lora_low`。**双专家推理开 CPU offload**（两 14B 同载，
+  非活跃专家 offload 到 CPU；后建的 vace/vace2 不受 vram 管理 → 显式 `.to(device)` 钉在 GPU）。
+- `eval_multiep.py`：加 `--lora_low`。
+- `check_load.py`/`check_provision.py`：处理 `i2v_vae`（in_dim36/无 CLIP）与双专家加载/零副作用。
+- `run_overfit.sh`：`wan2.2-i2v-a14b` 预设 + `EXPERT=high|low`（必填；设带边界 flag + 输出后缀 `…_a14b_{high,low}`）。
+
+### 18.3 退出门结果（单样本过拟合 `ep0_dataset_phys`，240×320，121 帧）
+- **load smoke**：两 DiT（40 块/in_dim36/无 CLIP）、两 from-DiT VACE（8 层/vace_in_dim96/after_proj=0/patch_embedding 存活）、mask_pq=8、switch_boundary=0.875。✓
+- **provision 门**：①形状 96/8层/5120/13824 + 权重拷贝 + after_proj=0 ✓；②**零副作用**：两专家都 provision、
+  `pipe()` 4 步带/不带控制 `max_abs_pixel_diff=0 bit_identical=True`（原生切换跨步把两分支都跑到，一次覆盖两专家零初始化）✓。
+- **训练**：high(GPU0)+low(GPU1) 并行各 1000 步（8-bit Adam，lr1e-5，~11.7s/it，~66GB/卡）。loss 平稳
+  （high last20≈0.006、low≈0.023，无发散）。ckpt `models/train/a2v_robotwin_ep0_vace_a14b_{high,low}/step-1000.safetensors`
+  （各 236 keys 全参 vace `vace_blocks.*`/`vace_patch_embedding.*`，无 lora/pipe 前缀）。
+- **因果门**（推理合并两专家 + 原生切换，real/none/shuffle）：
+
+| video | MAE-GT | motion | mean |
+| --- | --- | --- | --- |
+| GT | -- | 4.78 | 214.93 |
+| **REAL** | **3.14** | 4.97（×1.04） | 214.28 |
+| NONE | 21.48 | 2.72 | 221.16 |
+| SHUFFLE | 20.48 | 4.32 | 217.43 |
+
+  `real-vs-none MAE=21.56`、`real-vs-shuffle MAE=20.24`。判据（§12.6 i2v）：REAL MAE-GT 最低（3.14，
+  五基模最佳，优于 T4 4.83/T5 5.27/多ep-I2V 4.25）、REAL motion≈GT（×1.04）、real≪none/shuffle（~6.8×）。
+  **切换点不撕裂**：REAL motion 4.97≈GT 4.78（整段时间能量与 GT 同量级，无边界处运动突变），双专家在
+  switch 两侧产出连贯视频。**T6 PASS。**
+
+### 18.4 复现命令
+```bash
+cd /vepfs/wangshilong/code/DiffSynth-Studio
+PY=.venv/bin/python
+# 下载（只两套 DiT 专家分片；VAE/T5/tokenizer 复用 converted 资产）
+.venv/bin/modelscope download --model Wan-AI/Wan2.2-I2V-A14B \
+  --exclude 'models_t5_*.pth' 'Wan2.1_VAE.pth' 'assets/*' 'examples/*' 'google/*' 'nohup.out' \
+  --local_dir models/Wan-AI/Wan2.2-I2V-A14B
+CUDA_VISIBLE_DEVICES=0 $PY -m a2v.check_load --base_spec wan2.2-i2v-a14b
+CUDA_VISIBLE_DEVICES=0 $PY -m a2v.check_provision --base_spec wan2.2-i2v-a14b \
+  --dataset .cache/a2v_robotwin/ep0_dataset_phys --num_frames 13 --steps 4
+# 两专家分带过拟合（可并行不同卡）
+EXPERT=high CUDA_VISIBLE_DEVICES=0 bash a2v/run_overfit.sh wan2.2-i2v-a14b
+EXPERT=low  CUDA_VISIBLE_DEVICES=1 bash a2v/run_overfit.sh wan2.2-i2v-a14b
+# 合并因果门
+HI=models/train/a2v_robotwin_ep0_vace_a14b_high/step-1000.safetensors
+LO=models/train/a2v_robotwin_ep0_vace_a14b_low/step-1000.safetensors
+for c in real none shuffle; do CUDA_VISIBLE_DEVICES=0 $PY -m a2v.infer_a2v --base_spec wan2.2-i2v-a14b \
+  --dataset .cache/a2v_robotwin/ep0_dataset_phys --lora $HI --lora_low $LO \
+  --num_frames 121 --height 240 --width 320 --control $c \
+  --output .cache/a2v_robotwin/gen_a14b_s1000_$c.mp4; done
+$PY -m a2v.causal_metrics --dataset .cache/a2v_robotwin/ep0_dataset_phys --num_frames 121 \
+  --real .cache/a2v_robotwin/gen_a14b_s1000_real.mp4 --none .cache/a2v_robotwin/gen_a14b_s1000_none.mp4
+```
+
+### 18.5 注意/下一步
+- 双专家推理两 14B 同载，**必须开 CPU offload**（`infer_a2v` 已对 dual spec 自动加 `vram_config`+`vram_limit`）；
+  非活跃专家 offload 时 from-DiT 的 vace/vace2 可能落 CPU，已 `.to(device)` 钉回 GPU。约 4s/it、~45GB GPU。
+- 坏产物提醒：无（A14B 首训即过；坏 ckpt 仅历史 I2V `…_vace_i2v/step-*` 那批 lr1e-4）。
+- 下一步（择一）：① **A14B 多 episode 泛化已完成（见 §18.6）**；② `Wan2.2-VACE-Fun-A14B` 自带双 VACE warm-start 对照；
+  ③ 更大规模/多 task 混训；④ 编码升级（splat）。
+
+### 18.6 A14B 多 episode 泛化（2026-06-22，encoded-cache + 双专家，PASS）
+
+**结论：A14B 双专家在 10 个未见 episode 上泛化通过，且 held-out 与 train 几乎无 gap。** 复用 §16 同份
+train40/heldout10（240×320，105 帧），用 §17 encoded-cache（双专家**共享同一份 cache**，一次预编码两专家复用），
+两专家各 8 卡 DDP cache-train 800 步，推理合并 + 原生切换评测。
+
+- **阶段A 预编码**（一次）：`--task sft:data_process --expert high` 把 train40 编码进 `.cache/a2v_robotwin/cache_train40_a14b`
+  （40 个 `.pth`，4.1GB）。实测缓存内容：`input_latents`(1,16,27,30,40)、`y`(1,20,…)、`vace_context`(1,96,…)、`context`(T5 posi/nega)，
+  **无 `clip_feature`**（A14B 无 CLIP，符合预期）。cache 是编码器输出、与专家无关 → 两专家共用。
+- **阶段B cache-train**（高/低各一条 8 卡 DDP 作业，串行）：`--cache_train --task sft:train --expert {high,low}` +
+  各自带边界 `--min/max_timestep_boundary`（high `[0,0.358]`、low `[0.358,1]`），`REPEAT=4 EPOCHS=40 → 800 步`，
+  lr1e-5 8-bit Adam。**仅载单专家 DiT、跳过 T5/VAE/CLIP → ~65GB/卡**（比全编码 ~80GB 省 ~15GB），~7.2s/it、每专家~1.6h。
+  loss：high first=1.49→last20≈0.074（高噪带本就难，初值高合理）、low 0.060→0.036，均收敛无发散。
+  ckpt `models/train/a2v_robotwin_train40_vace_a14b_{high,low}_cached/step-800.safetensors`（各 236 keys 全参 vace）。
+- **评测**（`eval_multiep --lora_low`，双专家合并 + 原生切换 + CPU offload，~4.5s/视频帧组、held-out 10 行约 1.5h）：
+
+| 集合 | REAL MAE-GT | NONE MAE-GT | real<none | motion ratio | real-vs-none |
+| --- | --- | --- | --- | --- | --- |
+| **held-out ep40-49** | **5.36** | 56.72 | **10/10** | 1.05 | 56.50 |
+| train ep0-4 | 5.60 | 102.24 | 5/5 | 1.06 | 101.56 |
+
+  held-out(5.36) ≤ train(5.60) ⇒ **真泛化非记忆**；REAL motion 5.24≈GT 5.01（×1.05）；real≪none **~10.6×**
+  （A14B 强 I2V 先验在无控制时自由幻想，离 GT 极远 → 因果足迹巨大）；failed=0/10。**PASS。**
+  产物：`.cache/a2v_robotwin/eval_heldout_a14b/`、`eval_train_a14b/`（mp4 + metrics.json）。
+- 对照：单 ep A14B 因果门 REAL 3.14（§18.3）；多 ep held-out 5.36 略高（cache 训练随机性 + 多 ep 摊薄容量，
+  同 §17 观察）。与 §16 I2V-14B 多 ep（held-out 4.25/NONE 30.09）相比，A14B MAE 略高但 real-vs-none 分离更大。
+
+**复现**：
+```bash
+PY=.venv/bin/python; D=.cache/a2v_robotwin/ep_train40_phys; CACHE=.cache/a2v_robotwin/cache_train40_a14b
+# A: 预编码（单卡一次）
+CUDA_VISIBLE_DEVICES=0 .venv/bin/accelerate launch --num_processes 1 --mixed_precision bf16 -m a2v.train_a2v \
+  --base_spec wan2.2-i2v-a14b --task sft:data_process --expert high \
+  --dataset_base_path "$D" --dataset_metadata_path "$D/metadata.jsonl" \
+  --data_file_keys video,vace_video --extra_inputs vace_video,input_image \
+  --height 240 --width 320 --num_frames 105 --dataset_repeat 1 --output_path "$CACHE"
+# B: 两专家 cache-train（8 卡 DDP，各自带边界）
+for E in high low; do case $E in high) MN=0; MX=0.358;; low) MN=0.358; MX=1;; esac
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 .venv/bin/accelerate launch --num_processes 8 --mixed_precision bf16 -m a2v.train_a2v \
+  --base_spec wan2.2-i2v-a14b --cache_train --task sft:train --expert $E \
+  --dataset_base_path "$CACHE" --data_file_keys video,vace_video --trainable_models vace \
+  --learning_rate 1e-5 --dataset_repeat 4 --num_epochs 40 --save_steps 100 \
+  --min_timestep_boundary $MN --max_timestep_boundary $MX \
+  --output_path models/train/a2v_robotwin_train40_vace_a14b_${E}_cached \
+  --customized_optimizer bitsandbytes.optim.Adam8bit --enable_tensorboard_log; done
+# C: 评测
+HI=models/train/a2v_robotwin_train40_vace_a14b_high_cached/step-800.safetensors
+LO=models/train/a2v_robotwin_train40_vace_a14b_low_cached/step-800.safetensors
+CUDA_VISIBLE_DEVICES=0 $PY -m a2v.eval_multiep --base_spec wan2.2-i2v-a14b --lora $HI --lora_low $LO \
+  --dataset .cache/a2v_robotwin/ep_heldout10_phys --num_frames 105 --height 240 --width 320 \
+  --controls real,none --output_dir .cache/a2v_robotwin/eval_heldout_a14b
+```
+
+---
+
+## 19. Warm-start comparison: Wan2.2-VACE-Fun-A14B (pretrained dual VACE) vs T6 from-DiT (2026-06-22~24, PASS)
+
+**结论：两条路线都通过因果门，但 T6 的 from-DiT I2V-A14B（REAL MAE-GT 3.14）显著优于 Fun-A14B warm-start（6.45）。
+根因是首帧机制（i2v_vae 强锚定 vs vace_reference 弱），不是 VACE 初始化质量——warm-start 起始 loss 更低，但
+最终像素保真度被弱首帧拖累。** 这是一个"两条 A14B A2V 路线"的实用对照，不是单变量消融（见下"混淆"）。
+
+### 19.1 Fun-A14B 的关键事实（查 config.json + 实测）
+- `PAI/Wan2.2-VACE-Fun-A14B` 自带**预训练双 VACE**（high/low 各一份，与各自 noise_model 的 DiT 打包在同一
+  safetensors，34.7GB/份 bf16）。`high_noise_model/config.json`：`VaceWanModel, dim5120/40L, in_dim=16,
+  vace_layers(0,5..35), vace_in_dim96`——DiT 是 **in_dim=16 T2V 式**，控制完全经 VACE 分支 + `vace_reference_image`
+  （**非 i2v concat**）。
+- 结构与已注册的 `Wan2.1-VACE-14B` 完全一致（hash `7a513e1f257a861512b1afd387a8ecd9`，实测高噪 noise_model
+  文件 hash 精确匹配）→ 每份 noise_model 被探测为 **DiT + VACE 打包**（`has_pretrained_vace=True`），**无需改 diffsynth**。
+- 只下载两份 noise_model（~69GB），VAE(Wan2.1)/T5/tokenizer 复用 converted 资产。
+
+### 19.2 代码（仅 `a2v/`）
+- `base_spec.py`：注册 `wan2.2-vace-fun-a14b`（`has_pretrained_vace=True`、`experts=(high,low)`、
+  `first_frame_mode="vace_reference"`、in_dim16 DiT、`expert_dit_globs` 指两份单文件 noise_model、switch 0.875、train_bands 同 I2V-A14B）。
+- `provision.py`：`provision_a2v` 加"预训练+双专家"分支（不 from-DiT 造，只校验 pipe.vace/vace2 都在 + 装 unit）；
+  新 `build_bare_vace(spec,...)`（按 spec 形状建裸 VaceWanModel）。
+- `infer_a2v.py`：**关键修复**——from_pretrained 载入的预训练 vace/vace2 受 vram 管理（wrapped → state_dict 键带 `.module.`），
+  标准 vace ckpt 无法 `load_state_dict`（报 unexpected keys）。推理时对预训练分支改为 **build_bare_vace 建裸分支 + 载训练 ckpt + 钉 GPU**
+  （与 from-DiT 路同样的 un-managed 常驻 GPU 终态；DiT 仍 offload）。
+- `run_overfit.sh`：加 `wan2.2-vace-fun-a14b` case（`FIRST_FRAME=reference`、full-param vace、adam8bit、lr1e-5、`EXPERT=high|low` 带边界）。
+- `check_load.py`：双预训练 smoke（校验 vace + vace2 都预训练存在）。
+
+### 19.3 训练（同 T6 配方：单 ep ep0_dataset_phys 240×320，full-param vace，8-bit Adam，lr1e-5，1000 步/专家）
+- high/low 并行各 ~2.8h（vace_reference 加 ref 帧 → 每步略慢，~11s/it），~65GB/卡。ckpt
+  `models/train/a2v_robotwin_ep0_vace_funa14b_{high,low}/step-1000.safetensors`（各 236 keys 全参 vace）。
+- **warm-start 收敛**：high 专家 loss 起步 0.024（T6 from-DiT 起步 1.49）——预训练 VACE 已会控制，初始 loss 低得多。
+
+### 19.4 对照结果（单样本因果门，REAL/NONE/SHUFFLE，merged + 原生切换）
+| 指标 | **I2V-A14B from-DiT (T6)** | **Fun-A14B warm-start** |
+| --- | --- | --- |
+| VACE 初始化 | from-DiT 零初始化 | 预训练双 VACE |
+| DiT / 首帧 | in_dim36 I2V / **i2v_vae** | in_dim16 T2V 式 / **vace_reference** |
+| step-200 REAL MAE-GT | **12.99** | 40.95 |
+| **step-1000 REAL MAE-GT** | **3.14** | 6.45 |
+| step-1000 NONE MAE-GT | 21.48 | 31.94 |
+| step-1000 SHUFFLE MAE-GT | 20.48 | 25.70 |
+| REAL motion (GT 4.78) | 4.97 (×1.04) | 5.08 (×1.06) |
+| real-vs-none | 21.56 | 32.43 |
+| 因果门 | **PASS** | **PASS** |
+产物：`.cache/a2v_robotwin/gen_funa14b_s1000_{real,none,shuffle}.mp4`、`conv_{funwarm,i2vfromdit}_s200_*.mp4`。
+
+### 19.5 解读（混淆 + 结论）
+- **不是干净的单变量消融**：Fun-A14B 与 T6 在三个轴上同时不同——VACE 初始化（预训练 vs from-DiT）、DiT（in_dim16 T2V 式 vs in_dim36 I2V）、
+  首帧（vace_reference vs i2v_vae）。无法干净隔离，因为 Fun 的预训练 VACE 与其 in_dim16 DiT 绑定，硬塞进 I2V-A14B 壳并不"warm"。
+- **主导因素是首帧机制**：i2v_vae 把 GT 首帧经 VAE-concat 直接喂入 → REAL 强锚定 GT → 像素 MAE 低（step-200 就 12.99）；
+  vace_reference 锚定弱 → MAE 高（step-200 40.95）。warm-start 的预训练 VACE 让起始 loss 低，但赢不回弱首帧的像素差距。
+- **两者都是有效 A2V 模型**（都 PASS：REAL≪NONE/SHUFFLE、REAL motion≈GT、控制因果驱动）。Fun-A14B 的 NONE 更静（vace_reference 无轨迹→少动，motion 2.30），
+  符合 T1/T3 vace_reference 行为；I2V 类 NONE 自由运动。
+- **生产取舍**：RoboTwin A2V 像素保真，**首帧机制（i2v_vae）比 warm-start 更关键 → T6 from-DiT I2V-A14B 是更好的生产选择**；
+  Fun-A14B warm-start 可用但此处不占优。warm-start 的价值在收敛速度/少步数与"纯动作"(vace_reference 无强首帧泄漏) 场景。
+- 未做（可选）：Fun-A14B 多 episode 泛化（同 §18.6 cache 流程，复用 `eval_multiep --lora_low`）；预计同样被首帧机制主导，模式不变。
+
+### 19.6 复现命令
+```bash
+cd /vepfs/wangshilong/code/DiffSynth-Studio; PY=.venv/bin/python
+# 下载（仅两份 noise_model；T5/VAE/tokenizer 复用）
+.venv/bin/modelscope download --model PAI/Wan2.2-VACE-Fun-A14B \
+  --exclude 'models_t5_umt5-xxl-enc-bf16.pth' 'Wan2.1_VAE.pth' 'google/*' \
+  --local_dir models/PAI/Wan2.2-VACE-Fun-A14B
+CUDA_VISIBLE_DEVICES=0 $PY -m a2v.check_load --base_spec wan2.2-vace-fun-a14b
+EXPERT=high CUDA_VISIBLE_DEVICES=0 bash a2v/run_overfit.sh wan2.2-vace-fun-a14b
+EXPERT=low  CUDA_VISIBLE_DEVICES=1 bash a2v/run_overfit.sh wan2.2-vace-fun-a14b
+HI=models/train/a2v_robotwin_ep0_vace_funa14b_high/step-1000.safetensors
+LO=models/train/a2v_robotwin_ep0_vace_funa14b_low/step-1000.safetensors
+for c in real none shuffle; do CUDA_VISIBLE_DEVICES=0 $PY -m a2v.infer_a2v --base_spec wan2.2-vace-fun-a14b \
+  --dataset .cache/a2v_robotwin/ep0_dataset_phys --lora $HI --lora_low $LO \
+  --num_frames 121 --height 240 --width 320 --control $c \
+  --output .cache/a2v_robotwin/gen_funa14b_s1000_$c.mp4; done
+$PY -m a2v.causal_metrics --dataset .cache/a2v_robotwin/ep0_dataset_phys --num_frames 121 \
+  --real .cache/a2v_robotwin/gen_funa14b_s1000_real.mp4 --none .cache/a2v_robotwin/gen_funa14b_s1000_none.mp4
+```
