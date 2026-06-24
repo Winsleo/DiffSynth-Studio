@@ -114,13 +114,17 @@ def main() -> None:
     if args.remove_prefix_in_ckpt is None:
         args.remove_prefix_in_ckpt = "pipe.dit."  # stock default (non-spec usage)
 
-    # --- cache-train: encoders are NOT needed (their outputs are in the cache) ---
+    # --- cache-train: the big encoders (T5/CLIP) are NOT needed (their outputs are cached),
+    # but keep the DiT AND the small VAE. The VAE forward never runs (its encode unit is
+    # pruned for :train and input_latents come from the cache), yet the kept
+    # WanVideoUnit_NoiseInitializer reads the VAE config (z_dim / upsampling_factor) to shape
+    # the training noise -- so pipe.vae must exist or it crashes (NoneType.model). ---
     if args.cache_train:
         if spec is not None:
-            # model_paths()[0] is the DiT entry (str, or list of shards). Drop T5/VAE/CLIP
-            # so they are never loaded. The from-DiT VACE branch is still built from the DiT
-            # (ensure_vace); for VACE-1.3B the DiT checkpoint also carries the vace weights.
-            args.model_paths = json.dumps([spec.model_paths(expert=args.expert)[0]])
+            from a2v.base_spec import _abs
+            # [0] is the DiT entry (str, or list of shards). Add the VAE; drop T5/CLIP.
+            dit_entry = spec.model_paths(expert=args.expert)[0]
+            args.model_paths = json.dumps([dit_entry, _abs(spec.vae_path)])
         # metadata_path=None -> UnifiedDataset.load_from_cache (recursively finds *.pth)
         args.dataset_metadata_path = None
 

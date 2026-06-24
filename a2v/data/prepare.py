@@ -209,7 +209,16 @@ def build_sample(
             raise ValueError(f"num_frames must be 4n+1, got {args.num_frames}")
     else:
         start = item.get("start_frame", args.start_frame)
-        frame_indices = select_frame_indices(total_frames, args.num_frames, start=start, stride=args.stride)
+        try:
+            frame_indices = select_frame_indices(total_frames, args.num_frames, start=start, stride=args.stride)
+        except ValueError:
+            # Episode shorter than num_frames*stride. For batch dataset building across
+            # robots with varied episode lengths, skip it instead of aborting the whole run.
+            if args.skip_short:
+                print(f"[skip] {sample_name}: only {total_frames} source frames < "
+                      f"needed for num_frames={args.num_frames} stride={args.stride}")
+                return None
+            raise
 
     target_frames, src_size = read_video_frames(video_path, frame_indices, target_size, args.resize_mode)
     manifest_size = parse_size(item.get("original_size"), field_name="original_size") if item.get("original_size") is not None else None
@@ -303,6 +312,10 @@ def parse_args() -> argparse.Namespace:
                         help="Upper clamp on EE dot radius as a fraction of frame height.")
     parser.add_argument("--max_samples", type=int, default=None)
     parser.add_argument("--default_prompt", default="robot arm action trajectory")
+    parser.add_argument("--skip_short", action="store_true",
+                        help="Skip (with a warning) episodes that have fewer source frames than "
+                             "num_frames*stride, instead of aborting. For multi-robot batch builds "
+                             "where episode lengths vary.")
     parser.add_argument("--write_overlay", action="store_true")
     parser.add_argument("--overlay_alpha", type=float, default=0.45)
     return parser.parse_args()
@@ -330,10 +343,16 @@ def main() -> None:
 
     metadata_path = output_root / "metadata.jsonl"
     rows = []
+    skipped = 0
     for idx, item in enumerate(items):
         row = build_sample(item, idx, args, manifest_base, output_root)
+        if row is None:  # skip_short: episode too short, already logged
+            skipped += 1
+            continue
         rows.append(row)
         print(f"[{idx + 1}/{len(items)}] wrote {row['video'][0].split('/')[0]} with {len(row['frame_indices'])} frames")
+    if skipped:
+        print(f"Skipped {skipped}/{len(items)} too-short episodes")
 
     with metadata_path.open("w", encoding="utf-8") as f:
         for row in rows:

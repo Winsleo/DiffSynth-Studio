@@ -101,9 +101,13 @@ FRAMES="${FRAMES:-121}"
 REPEAT="${REPEAT:-100}"
 EPOCHS="${EPOCHS:-10}"
 NPROC="${NPROC:-1}"     # data-parallel GPUs (DDP). 1 = single GPU (unchanged default).
+SAVE_STEPS="${SAVE_STEPS:-100}"
+CACHE_TRAIN="${CACHE_TRAIN:-0}"   # 1 = train from a pre-encoded cache (CACHE_DIR); loads only the DiT
+CACHE_DIR="${CACHE_DIR:-}"        # encoded-cache dir from `--task sft:data_process` (required if CACHE_TRAIN=1)
+RESUME="${RESUME:-}"              # checkpoint dir/file to resume from (long production runs)
 DRY_RUN="${DRY_RUN:-0}"
 
-# first-frame seam -> which inputs to feed
+# first-frame seam -> which inputs to feed (only used when encoding; cache mode skips encoders)
 if [ "$FIRST_FRAME" = "reference" ]; then
   DATA_FILE_KEYS="video,vace_video,vace_reference_image"
   EXTRA_INPUTS="vace_video,vace_reference_image"
@@ -111,6 +115,22 @@ else  # image: i2v_concat / ti2v_fused -> input_image (derived from video[0] by 
   DATA_FILE_KEYS="video,vace_video"
   EXTRA_INPUTS="vace_video,input_image"
 fi
+
+# dataset source: encoded cache (only DiT loaded; encoders + their inputs skipped) vs raw PNG dataset
+DATA_ARGS=()
+if [ "$CACHE_TRAIN" = "1" ]; then
+  [ -n "$CACHE_DIR" ] || { echo "CACHE_TRAIN=1 requires CACHE_DIR=<encoded cache dir>"; exit 1; }
+  # --task sft:train prunes the encoder units (T5 / VAE-encode / VACE-encode); their outputs
+  # are in the cache. The kept NoiseInitializer still reads the VAE config, so train_a2v
+  # keeps the (small) VAE loaded alongside the DiT.
+  DATA_ARGS+=(--task sft:train --cache_train --dataset_base_path "$CACHE_DIR" --data_file_keys "video,vace_video")
+else
+  DATA_ARGS+=(--dataset_base_path "$DATASET" --dataset_metadata_path "$DATASET/metadata.jsonl"
+              --data_file_keys "$DATA_FILE_KEYS" --extra_inputs "$EXTRA_INPUTS")
+fi
+
+RESUME_ARGS=()
+[ -n "$RESUME" ] && RESUME_ARGS+=(--resume_from_checkpoint "$RESUME")
 
 # train mode -> LoRA (pretrained vace) vs full-param vace (from-DiT)
 MODE_ARGS=()
@@ -136,21 +156,20 @@ case "$SPEC" in
     EXPERT_ARGS+=(--expert "$EXPERT" --min_timestep_boundary "$MIN_TS" --max_timestep_boundary "$MAX_TS") ;;
 esac
 
-echo "[run_overfit] spec=$SPEC dataset=$DATASET out=$OUT ${HEIGHT}x${WIDTH} frames=$FRAMES repeat=$REPEAT epochs=$EPOCHS nproc=$NPROC lr=$LR mode=$TRAIN_MODE opt=$OPTIMIZER first_frame=$FIRST_FRAME${EXPERT_ARGS:+ expert=$EXPERT band=[$MIN_TS,$MAX_TS]}"
+SRC_DESC=$([ "$CACHE_TRAIN" = "1" ] && echo "cache=$CACHE_DIR" || echo "dataset=$DATASET")
+echo "[run_overfit] spec=$SPEC $SRC_DESC out=$OUT ${HEIGHT}x${WIDTH} frames=$FRAMES repeat=$REPEAT epochs=$EPOCHS nproc=$NPROC lr=$LR mode=$TRAIN_MODE opt=$OPTIMIZER first_frame=$FIRST_FRAME${EXPERT_ARGS:+ expert=$EXPERT band=[$MIN_TS,$MAX_TS]}${RESUME:+ resume=$RESUME}"
 
 CMD=(.venv/bin/accelerate launch --num_processes "$NPROC" --mixed_precision bf16 -m a2v.train_a2v \
   --base_spec "$SPEC" \
-  --dataset_base_path "$DATASET" \
-  --dataset_metadata_path "$DATASET/metadata.jsonl" \
-  --data_file_keys "$DATA_FILE_KEYS" \
-  --extra_inputs "$EXTRA_INPUTS" \
+  "${DATA_ARGS[@]}" \
   --height "$HEIGHT" --width "$WIDTH" --num_frames "$FRAMES" \
   "${MODE_ARGS[@]}" \
   "${EXPERT_ARGS[@]}" \
+  "${RESUME_ARGS[@]}" \
   --learning_rate "$LR" \
   --dataset_repeat "$REPEAT" \
   --num_epochs "$EPOCHS" \
-  --save_steps 100 \
+  --save_steps "$SAVE_STEPS" \
   --output_path "$OUT" \
   "${OPT_ARGS[@]}" \
   --enable_tensorboard_log
