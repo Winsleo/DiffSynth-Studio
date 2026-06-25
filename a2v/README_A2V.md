@@ -124,7 +124,15 @@ DRY_RUN=1 bash a2v/train.sh wan2.2-ti2v-5b   # print the resolved command, run n
 | `CACHE_TRAIN=1` `CACHE_DIR=` | train from a pre-encoded cache (see below) |
 | `RESUME=<ckpt>` | resume a long run |
 | `EXPERT=high\|low` | **required** for `*-a14b` (selects the MoE expert + its timestep band) |
+| `LR_SCHEDULE=constant\|cosine` | default `constant`; `cosine` = linear warmup → cosine decay (then `LR` is the **peak**) |
+| `WARMUP=<steps>` | cosine warmup steps; `0` → 3% of total (`num_epochs × len(dataset)`) |
+| `LR_MIN_RATIO=<frac>` | cosine final lr as a fraction of peak (default `0`) |
 | `DRY_RUN=1` | print the command without launching |
+
+> **LR schedule**: the default is constant lr (unchanged). For longer / larger runs, `LR_SCHEDULE=cosine`
+> warms up then cosine-decays — it lets you safely use a higher peak `LR` (warmup avoids early
+> divergence) and settle into a lower final loss (decay reduces end-of-training noise). Example:
+> `LR_SCHEDULE=cosine WARMUP=300 LR=2e-5 LR_MIN_RATIO=0.05 ... bash a2v/train.sh <spec>`.
 
 Checkpoints: `models/train/.../step-*.safetensors` (LoRA for `vace-1.3b`, full VACE state
 dict otherwise).

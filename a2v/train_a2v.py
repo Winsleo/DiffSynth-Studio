@@ -74,6 +74,40 @@ def _make_training_module_cls(stock):
     return A2VWanTrainingModule
 
 
+def _install_cosine_lr_schedule(args, dataset) -> None:
+    """Replace the stock trainer's hardcoded ConstantLR with linear-warmup + cosine decay.
+
+    The stock loop (diffsynth/diffusion/runner.py) builds ``ConstantLR(optimizer)`` and steps
+    it every optimizer step; we monkeypatch that symbol to a ``LambdaLR`` so no diffsynth edit
+    is needed. accelerate (>=1.x) advances a *prepared* scheduler ``num_processes`` steps per
+    optimizer step, so over training the scheduler sees ``T = num_epochs * len(dataset)`` steps
+    regardless of NPROC (len(dataset) already includes ``dataset_repeat``). LR ramps 0 -> peak
+    (= ``--learning_rate``) across ``warmup`` steps, then cosine-decays peak -> ``lr_min_ratio *
+    peak`` over the remainder. Assumes ``gradient_accumulation_steps == 1`` (our recipes).
+    """
+    import math
+    import torch
+
+    total_steps = max(1, args.num_epochs * len(dataset))
+    warmup = args.lr_warmup_steps if args.lr_warmup_steps > 0 else max(1, round(0.03 * total_steps))
+    warmup = min(warmup, total_steps)
+    min_ratio = args.lr_min_ratio
+
+    def lr_lambda(step: int) -> float:
+        if step < warmup:
+            return step / warmup
+        progress = min(1.0, (step - warmup) / max(1, total_steps - warmup))
+        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return min_ratio + (1.0 - min_ratio) * cosine
+
+    def constant_lr_factory(optimizer, *a, **k):
+        return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+    torch.optim.lr_scheduler.ConstantLR = constant_lr_factory
+    print(f"[a2v] lr_schedule=cosine peak_lr={args.learning_rate} warmup={warmup} "
+          f"total_steps={total_steps} min_ratio={min_ratio}")
+
+
 def main() -> None:
     stock = _load_stock_train_module()
     parser = stock.wan_parser()
@@ -85,6 +119,15 @@ def main() -> None:
                              "Selects that expert's DiT via spec.model_paths(expert=...) and "
                              "should be paired with the matching --min/--max_timestep_boundary "
                              "band (see train.sh). Ignored for single-expert specs.")
+    parser.add_argument("--lr_schedule", default="constant", choices=("constant", "cosine"),
+                        help="LR schedule. 'constant' (default) = stock behavior. 'cosine' = "
+                             "linear warmup then cosine decay to --lr_min_ratio * --learning_rate "
+                             "(which becomes the PEAK lr).")
+    parser.add_argument("--lr_warmup_steps", type=int, default=0,
+                        help="Warmup steps for --lr_schedule cosine; 0 -> 3%% of total steps "
+                             "(total = num_epochs * len(dataset)).")
+    parser.add_argument("--lr_min_ratio", type=float, default=0.0,
+                        help="Final lr as a fraction of peak for --lr_schedule cosine (0 -> to 0).")
     parser.add_argument("--cache_train", action="store_true",
                         help="Train from a pre-encoded cache (built with --task sft:data_process). "
                              "Loads ONLY the DiT (T5/VAE/CLIP outputs come from the cache, so those "
@@ -220,6 +263,10 @@ def main() -> None:
         "direct_distill": launch_training_task,  # noqa: F405
         "direct_distill:train": launch_training_task,  # noqa: F405
     }
+    # Opt-in warmup+cosine LR (default constant = unchanged stock behavior). Training tasks only.
+    if args.lr_schedule == "cosine" and not args.task.endswith(":data_process"):
+        _install_cosine_lr_schedule(args, dataset)
+
     launcher_map[args.task](accelerator, dataset, model, model_logger, args=args)
 
 

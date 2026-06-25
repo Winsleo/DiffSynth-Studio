@@ -29,6 +29,9 @@
 #   CACHE_TRAIN=1 CACHE_DIR=   train from an encoded cache (see Modes)
 #   RESUME=<ckpt>             resume a long run
 #   EXPERT=high|low           REQUIRED for the dual-expert A14B specs (selects expert+band)
+#   LR_SCHEDULE=constant|cosine   default constant; cosine = warmup -> cosine decay (LR = peak)
+#   WARMUP=<steps>            cosine warmup steps (0 -> 3% of total = num_epochs*len(dataset))
+#   LR_MIN_RATIO=<frac>       cosine final lr as a fraction of peak (default 0)
 #   DRY_RUN=1                 print the resolved command without launching
 #
 # Why presets differ: from-DiT VACE must train full-param (its zero-init control entry/exit
@@ -107,6 +110,9 @@ SAVE_STEPS="${SAVE_STEPS:-100}"
 CACHE_TRAIN="${CACHE_TRAIN:-0}"   # 1 = train from a pre-encoded cache (CACHE_DIR); loads only the DiT
 CACHE_DIR="${CACHE_DIR:-}"        # encoded-cache dir from `--task sft:data_process` (required if CACHE_TRAIN=1)
 RESUME="${RESUME:-}"              # checkpoint dir/file to resume from (long production runs)
+LR_SCHEDULE="${LR_SCHEDULE:-constant}"  # constant (default) | cosine (warmup -> cosine decay; LR = peak)
+WARMUP="${WARMUP:-0}"                    # cosine warmup steps; 0 -> 3% of total (num_epochs*len(dataset))
+LR_MIN_RATIO="${LR_MIN_RATIO:-0.0}"     # cosine final lr as a fraction of peak
 DRY_RUN="${DRY_RUN:-0}"
 
 # first-frame seam -> which inputs to feed (only used when encoding; cache mode skips encoders)
@@ -134,6 +140,9 @@ fi
 RESUME_ARGS=()
 [ -n "$RESUME" ] && RESUME_ARGS+=(--resume_from_checkpoint "$RESUME")
 
+# lr schedule (default constant = unchanged stock behavior; cosine = warmup + cosine decay)
+SCHED_ARGS=(--lr_schedule "$LR_SCHEDULE" --lr_warmup_steps "$WARMUP" --lr_min_ratio "$LR_MIN_RATIO")
+
 # train mode -> LoRA (pretrained vace) vs full-param vace (from-DiT)
 MODE_ARGS=()
 if [ "$TRAIN_MODE" = "lora" ]; then
@@ -159,7 +168,7 @@ case "$SPEC" in
 esac
 
 SRC_DESC=$([ "$CACHE_TRAIN" = "1" ] && echo "cache=$CACHE_DIR" || echo "dataset=$DATASET")
-echo "[train] spec=$SPEC $SRC_DESC out=$OUT ${HEIGHT}x${WIDTH} frames=$FRAMES repeat=$REPEAT epochs=$EPOCHS nproc=$NPROC lr=$LR mode=$TRAIN_MODE opt=$OPTIMIZER first_frame=$FIRST_FRAME${EXPERT_ARGS:+ expert=$EXPERT band=[$MIN_TS,$MAX_TS]}${RESUME:+ resume=$RESUME}"
+echo "[train] spec=$SPEC $SRC_DESC out=$OUT ${HEIGHT}x${WIDTH} frames=$FRAMES repeat=$REPEAT epochs=$EPOCHS nproc=$NPROC lr=$LR sched=$LR_SCHEDULE${LR_SCHEDULE:+$([ "$LR_SCHEDULE" = cosine ] && echo " warmup=$WARMUP min_ratio=$LR_MIN_RATIO")} mode=$TRAIN_MODE opt=$OPTIMIZER first_frame=$FIRST_FRAME${EXPERT_ARGS:+ expert=$EXPERT band=[$MIN_TS,$MAX_TS]}${RESUME:+ resume=$RESUME}"
 
 CMD=(.venv/bin/accelerate launch --num_processes "$NPROC" --mixed_precision bf16 -m a2v.train_a2v \
   --base_spec "$SPEC" \
@@ -168,6 +177,7 @@ CMD=(.venv/bin/accelerate launch --num_processes "$NPROC" --mixed_precision bf16
   "${MODE_ARGS[@]}" \
   "${EXPERT_ARGS[@]}" \
   "${RESUME_ARGS[@]}" \
+  "${SCHED_ARGS[@]}" \
   --learning_rate "$LR" \
   --dataset_repeat "$REPEAT" \
   --num_epochs "$EPOCHS" \
