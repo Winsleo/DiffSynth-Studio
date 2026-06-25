@@ -154,6 +154,53 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 SPEC=wan2.2-ti2v-5b CACHE_TRAIN=1 \
 > Long runs should be detached (`tmux` / `nohup`) so a disconnect does not kill training;
 > resume with `RESUME=<ckpt>`.
 
+### Dual-expert A14B (`wan2.2-i2v-a14b`, `wan2.2-vace-fun-a14b`)
+
+A14B bases are a **two-expert MoE**: a high-noise expert and a low-noise expert. Train each as
+its own job — `EXPERT=` selects the expert and its timestep band — then pass **both**
+checkpoints at inference; DiffSynth switches experts by timestep automatically.
+
+```bash
+# 1. train the two experts (separate GPUs, or sequentially)
+EXPERT=high CUDA_VISIBLE_DEVICES=0 bash a2v/train.sh wan2.2-i2v-a14b   # -> ..._vace_a14b_high/
+EXPERT=low  CUDA_VISIBLE_DEVICES=1 bash a2v/train.sh wan2.2-i2v-a14b   # -> ..._vace_a14b_low/
+
+# 2. combined causal gate: high via --lora, low via --lora_low
+HI=models/train/a2v_robotwin_ep0_vace_a14b_high/step-1000.safetensors
+LO=models/train/a2v_robotwin_ep0_vace_a14b_low/step-1000.safetensors
+for c in real none shuffle; do $PY -m a2v.infer_a2v --base_spec wan2.2-i2v-a14b \
+  --dataset .cache/a2v_robotwin/ep0_dataset_phys --lora $HI --lora_low $LO \
+  --num_frames 121 --height 240 --width 320 --control $c \
+  --output .cache/a2v_robotwin/gen_a14b_$c.mp4; done
+$PY -m a2v.causal_metrics --dataset .cache/a2v_robotwin/ep0_dataset_phys \
+  --real .cache/a2v_robotwin/gen_a14b_real.mp4 --none .cache/a2v_robotwin/gen_a14b_none.mp4
+```
+
+- **Two A14B variants**: `wan2.2-i2v-a14b` builds VACE from-DiT with the `i2v_vae` first frame
+  (strongest pixel fidelity — best single-episode gate so far); `wan2.2-vace-fun-a14b`
+  warm-starts from PAI's pretrained dual VACE with `vace_reference`. Same `EXPERT=high|low`
+  two-run pattern; downloads differ (see `A2V_HISTORY.md` §18–§19).
+- **Inference loads both 14B experts** → CPU offload is enabled automatically (~45GB GPU);
+  a single GPU is enough. Always pass `--lora_low` for A14B (omitting it errors out).
+- **Multi-episode + cache**: pre-encode once (the cache is shared by both experts), then
+  cache-train each expert with its `EXPERT=` band, and evaluate with `--lora_low`:
+
+  ```bash
+  # encode once -> shared cache; then per-expert cache-train
+  for E in high low; do
+    CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 SPEC=wan2.2-i2v-a14b CACHE_TRAIN=1 \
+      CACHE_DIR=.cache/a2v_robotwin/cache_train40_a14b NPROC=8 EXPERT=$E \
+      LR=1e-5 REPEAT=4 EPOCHS=40 SAVE_STEPS=100 \
+      OUT=models/train/a2v_robotwin_train40_vace_a14b_${E}_cached \
+      bash a2v/train.sh wan2.2-i2v-a14b
+  done
+  $PY -m a2v.eval_multiep --base_spec wan2.2-i2v-a14b \
+    --lora .../a14b_high_cached/step-800.safetensors \
+    --lora_low .../a14b_low_cached/step-800.safetensors \
+    --dataset .cache/a2v_robotwin/ep_heldout10_phys --num_frames 105 --height 240 --width 320 \
+    --controls real,none --output_dir .cache/a2v_robotwin/eval_heldout_a14b
+  ```
+
 ---
 
 ## 3. Evaluate (causal gate)
