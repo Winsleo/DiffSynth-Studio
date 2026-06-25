@@ -69,7 +69,7 @@
 - `data/robotwin_adapter.py`：读 hdf5 → `actions.npy[T,16]`/`intrinsic.npy`/`extrinsic.npy(c2w)` + `manifest.jsonl`（video 指向原 mp4）。
 - `train_a2v.py`：薄封装 stock `WanTrainingModule`+`wan_parser`，仅把 dataset 的 operator 换成 `frame_list_video_operator`（PNG 列表路由）。
 - `infer_a2v.py`：加载 base+VACE-LoRA，从 `vace_video`+`vace_reference_image` 生成；`--control real|none|shuffle`（none/shuffle 为负对照）。
-- `run_overfit.sh`：单样本 LoRA-on-vace 过拟合配方；本地 `--model_paths` JSON（DiT+VACE / Wan2.1_VAE / umt5-xxl t5，均在 `models/`）。
+- `train.sh`：单样本 LoRA-on-vace 过拟合配方；本地 `--model_paths` JSON（DiT+VACE / Wan2.1_VAE / umt5-xxl t5，均在 `models/`）。
 
 **复现命令（仓库根目录，venv=`.venv`，已装 h5py/tensorboard）：**
 ```bash
@@ -79,7 +79,7 @@ $PY -m a2v.data.robotwin_adapter --task beat_block_hammer --robot_mode aloha-agi
 $PY -m a2v.data.prepare --manifest .cache/a2v_robotwin/ep0_work/manifest.jsonl \
     --output_dir .cache/a2v_robotwin/ep0_dataset --height 240 --width 320 --num_frames 121 \
     --resize_mode stretch --gripper_z_offset 0 --write_overlay
-bash a2v/run_overfit.sh        # → models/train/a2v_robotwin_ep0_lora/step-*.safetensors
+bash a2v/train.sh        # → models/train/a2v_robotwin_ep0_lora/step-*.safetensors
 $PY -m a2v.infer_a2v --dataset .cache/a2v_robotwin/ep0_dataset \
     --lora models/train/a2v_robotwin_ep0_lora/step-1000.safetensors \
     --num_frames 121 --height 240 --width 320 --control real --output .cache/a2v_robotwin/gen.mp4
@@ -110,7 +110,7 @@ $PY -m a2v.infer_a2v --dataset .cache/a2v_robotwin/ep0_dataset \
 - 端到端：spec 驱动 infer(`--base_spec`) 复用 T1 的 step-1000 LoRA，输出与 T1 硬编码路径 **MD5 完全一致**（逐帧 Δ=0）。
 
 **接线方式（保持 T1 命令可用）：** train/infer 新增 `--base_spec`(默认 `wan2.1-vace-1.3b`)；spec 填充
-`model_paths/tokenizer/lora_base_model/remove_prefix` 的默认值，**显式 CLI 仍覆盖**。`run_overfit.sh` 已简化为
+`model_paths/tokenizer/lora_base_model/remove_prefix` 的默认值，**显式 CLI 仍覆盖**。`train.sh` 已简化为
 `--base_spec` 驱动。
 
 **关键工程注意：** 默认训练 task=`sft`(非 `:train`/`:data_process`)，`split_pipeline_units` 不动 `pipe.units`，
@@ -165,7 +165,7 @@ $PY -m a2v.infer_a2v --dataset .cache/a2v_robotwin/ep0_dataset \
 **永远不执行**（死代码）。后果：VACE LoRA 用 `pipe.dit.` 去 strip 对 `pipe.vace.*` key 无匹配 → 存成带
 `pipe.vace.` 前缀的 key → `infer_a2v` 的 `pipe.load_lora(vace, …)` 静默匹配不到 → **LoRA 完全没生效 → 输出纯基模垃圾**
 （不同 step 输出逐字节相同、real 比 none 还差，就是这个症状）。
-- **为何 T1 没踩**：T1 时 run_overfit.sh 显式传了 `--remove_prefix_in_ckpt pipe.vace.`；T2 简化成 spec 驱动后暴露。
+- **为何 T1 没踩**：T1 时 train.sh 显式传了 `--remove_prefix_in_ckpt pipe.vace.`；T2 简化成 spec 驱动后暴露。
 - **为何 T2 parity 漏检**：parity 复用 T1 旧 LoRA、**没重训**，从未走保存路径。
 - **修法**：`parser.set_defaults(remove_prefix_in_ckpt=None)` 让"显式传入 vs 未传"可区分，spec 分支照常生效，
   无 spec 时回落 `"pipe.dit."`。三场景已模拟验证：spec无flag→`pipe.vace.`、spec+显式→`pipe.dit.`、无spec→`pipe.dit.`。
@@ -178,7 +178,7 @@ $PY -m a2v.infer_a2v --dataset .cache/a2v_robotwin/ep0_dataset \
 
 **train_a2v 修复已实测（06-13）：** 用修好的代码跑 4 步重训，落盘 LoRA 的 300 个 key **零 `pipe.` 前缀、全为 `vace_blocks.*`**，
 key-set 与已知可用旧 LoRA 命名空间逐一致 ⇒ **重训原生产出可加载 key，`*.fixedkeys` 这种手工剥前缀的临时产物以后不再需要**。
-直接 `bash a2v/run_overfit.sh`（已默认指向 `ep0_dataset_phys`）即可。
+直接 `bash a2v/train.sh`（已默认指向 `ep0_dataset_phys`）即可。
 
 > **教训给 T3+**：任何"抽象/重构"后，**对拍必须包含一次真·重训 + load_lora 往返**，不能只复用旧 ckpt 对拍推理，
 > 否则保存路径的 seam（remove_prefix/key 命名）测不到。T3 的 `create_vace_from_dit` 退出门应显式加 LoRA 存取往返。
@@ -201,7 +201,7 @@ key-set 与已知可用旧 LoRA 命名空间逐一致 ⇒ **重训原生产出�
   在 freeze/挂训前就存在（否则 stock 在 `pipe.vace is None` 时静默跳过）。T2 路径幂等无变化。
 - `check_provision.py`：3 道门 —— ①形状(96/15层/拷贝核对) ②**零副作用**(真 `pipe()` 带控制 vs 不带控制逐位相同) ③(可选`--parity`)
   用 VACE-1.3B 自己的 DiT 造壳后 `load_state_dict(官方vace,strict)` 全等。**全绿。**
-- `run_overfit_t2v.sh`：T3 **全参** vace 过拟合（`--trainable_models vace`，非 LoRA，见下纠错）；`run_overfit.sh` 参数化(SPEC/DATASET/OUT)。
+- `run_overfit_t2v.sh`：T3 **全参** vace 过拟合（`--trainable_models vace`，非 LoRA，见下纠错）；`train.sh` 参数化(SPEC/DATASET/OUT)。
 - `infer_a2v.py`：`_load_vace_weights` 自动辨识 LoRA(含`lora_`键)→`load_lora` / 全参 vace→`load_state_dict`。
 
 **★ 纠错 1（致命）：from-DiT vace 不能用 LoRA 训，必须全参。** 控制信号**只**经 `vace_patch_embedding`(Conv3d) 进、
@@ -501,7 +501,7 @@ $PY -m a2v.causal_metrics --dataset .cache/a2v_robotwin/ep0_dataset_phys_256x320
 **结论：VACE-1.3B LoRA 的正式多 episode 泛化门通过。** 使用 RoboTwin `beat_block_hammer/aloha-agilex_clean_50`，train=ep0-39，held-out=ep40-49，105 帧，240x320。同一个 final LoRA 在 held-out 10 个未见 episode 上满足主判据：REAL 明显比 NONE 更接近 GT，且 10/10 episode 均 real<none；REAL motion 与 GT 同量级。
 
 ### 15.1 代码与数据
-- `run_overfit.sh` 增加 `REPEAT` / `EPOCHS` / `DRY_RUN` env override；默认仍是 `REPEAT=100`、`EPOCHS=10`、`FRAMES=121`，不破坏单样本过拟合复现。
+- `train.sh` 增加 `REPEAT` / `EPOCHS` / `DRY_RUN` env override；默认仍是 `REPEAT=100`、`EPOCHS=10`、`FRAMES=121`，不破坏单样本过拟合复现。
 - `infer_a2v.py` 抽出 `build_pipe_with_vace`、`first_frame_kwargs`、`generate_one`，供单行 CLI 与多行评测复用；原 CLI 参数保持不变。
 - 新增 `a2v/eval_multiep.py`：一次加载模型，按 metadata 行循环生成 `real,none`，保存 mp4，写 `metrics.json`，打印逐 episode 表和 SUMMARY。
 - 数据集已 validate：`.cache/a2v_robotwin/ep_train40_phys` 40 行、`.cache/a2v_robotwin/ep_heldout10_phys` 10 行；每行 105 帧、240x320。
@@ -511,7 +511,7 @@ $PY -m a2v.causal_metrics --dataset .cache/a2v_robotwin/ep0_dataset_phys_256x320
 FRAMES=105 REPEAT=1 EPOCHS=120 \
 OUT=models/train/a2v_robotwin_train40_vace1p3b_lora \
 DATASET=.cache/a2v_robotwin/ep_train40_phys \
-CUDA_VISIBLE_DEVICES=0 bash a2v/run_overfit.sh wan2.1-vace-1.3b
+CUDA_VISIBLE_DEVICES=0 bash a2v/train.sh wan2.1-vace-1.3b
 ```
 - 步数：40 rows * 120 epochs = 4800 steps；最终 ckpt `models/train/a2v_robotwin_train40_vace1p3b_lora/step-4800.safetensors`，大小 43,781,016 bytes。
 - TensorBoard loss：4800 条；step1=0.01057，step1000=0.00974，step2400=0.02093，step4800=0.01559；全程有波动但未发散，最终以 causal eval gate 为准。
@@ -563,17 +563,17 @@ $PY -m a2v.eval_multiep --base_spec wan2.1-vace-1.3b --lora $CK \
 8 卡 DDP 训练 from-DiT 全参 vace，held-out 10 个未见 episode **10/10 real<none**、REAL MAE-GT 4.25 ≪ NONE 30.09、
 motion ratio 1.06；held-out(4.25) 与 train(4.76) 几乎无 gap ⇒ 真泛化非记忆。
 
-### 16.1 代码硬化（eval_multiep）+ 多卡（run_overfit.sh）
+### 16.1 代码硬化（eval_multiep）+ 多卡（train.sh）
 - `eval_multiep.py`：**A1 每行 try/except**（单行失败记 `failures`、从聚合剔除、不中断整轮，metrics.json 加 `failures`/`failed`）；
   **A2 motion_ratio nan 防御**（聚合仅用有限值；全静止导致 nan 时跳过 ratio 子条件，主判据仍判）。1.3B held-out 复跑结果逐位一致（real=6.25/10-10/failed=0）= 零回归。
-- `run_overfit.sh`：加 `NPROC` env（普通 accelerate DDP，默认 1 不变）。8 卡 20 步 smoke 干净退出，from-DiT vace 在 DDP 下每 rank 确定性克隆、训练正常、无 OOM。
+- `train.sh`：加 `NPROC` env（普通 accelerate DDP，默认 1 不变）。8 卡 20 步 smoke 干净退出，from-DiT vace 在 DDP 下每 rank 确定性克隆、训练正常、无 OOM。
 
 ### 16.2 训练配方（8 卡 DDP）
 ```bash
 NPROC=8 FRAMES=105 LR=1e-5 REPEAT=4 EPOCHS=40 \
 OUT=models/train/a2v_robotwin_train40_vace_i2v \
 DATASET=.cache/a2v_robotwin/ep_train40_phys \
-bash a2v/run_overfit.sh wan2.1-i2v-14b-480p
+bash a2v/train.sh wan2.1-i2v-14b-480p
 ```
 - 步数：`EPOCHS×(40×REPEAT)/NPROC = 40×160/8 = 800` 步（≈6400 sample-exposures）；~10s/it、每卡 ~80GB（8-bit + grad-ckpt，紧但不 OOM）、约 2.2h。
 - loss：800 步从 ~0.06 降到 0.001–0.01，平稳无发散（lr=1e-5，对比单 ep lr=1e-4 发散）。
@@ -617,7 +617,7 @@ CUDA_VISIBLE_DEVICES=0 $PY -m a2v.eval_multiep --base_spec wan2.1-i2v-14b-480p -
 ### 17.2 代码（仅 `a2v/`）
 - `train_a2v.py`：加 `--cache_train`。① `model_paths` 砍到只剩 DiT 条目（`spec.model_paths()[0]`，含 dit_glob 分片 list；VACE-1.3B 的 DiT ckpt 自带 vace 权重，from-DiT 基模由 `ensure_vace` 从 DiT 造）；② `dataset_metadata_path=None` 触发 load_from_cache。
 - **修了一个集成 bug**：`--task sft:train` 会把编码器侧 `WanVideoUnit_VACE`（产 `vace_context`）从 `pipe.units` split 掉，原 `provision_a2v` 的 `install_vace_unit` 因此报 "No WanVideoUnit_VACE found"。cache 模式下 `vace_context` 已缓存、不需该编码器单元，故 cache_train 只调 `ensure_vace`（建 vace 模型）、**跳过 install_vace_unit**。
-- `run_overfit.sh` 的 `NPROC`（§16）用于多卡 cache-train。
+- `train.sh` 的 `NPROC`（§16）用于多卡 cache-train。
 
 ### 17.3 实测（I2V-14B，train40，8 卡 DDP，800 步）
 | | 非缓存（§16） | cache-train |
@@ -700,7 +700,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 .venv/bin/accelerate launch --num_processes
   非活跃专家 offload 到 CPU；后建的 vace/vace2 不受 vram 管理 → 显式 `.to(device)` 钉在 GPU）。
 - `eval_multiep.py`：加 `--lora_low`。
 - `check_load.py`/`check_provision.py`：处理 `i2v_vae`（in_dim36/无 CLIP）与双专家加载/零副作用。
-- `run_overfit.sh`：`wan2.2-i2v-a14b` 预设 + `EXPERT=high|low`（必填；设带边界 flag + 输出后缀 `…_a14b_{high,low}`）。
+- `train.sh`：`wan2.2-i2v-a14b` 预设 + `EXPERT=high|low`（必填；设带边界 flag + 输出后缀 `…_a14b_{high,low}`）。
 
 ### 18.3 退出门结果（单样本过拟合 `ep0_dataset_phys`，240×320，121 帧）
 - **load smoke**：两 DiT（40 块/in_dim36/无 CLIP）、两 from-DiT VACE（8 层/vace_in_dim96/after_proj=0/patch_embedding 存活）、mask_pq=8、switch_boundary=0.875。✓
@@ -735,8 +735,8 @@ CUDA_VISIBLE_DEVICES=0 $PY -m a2v.check_load --base_spec wan2.2-i2v-a14b
 CUDA_VISIBLE_DEVICES=0 $PY -m a2v.check_provision --base_spec wan2.2-i2v-a14b \
   --dataset .cache/a2v_robotwin/ep0_dataset_phys --num_frames 13 --steps 4
 # 两专家分带过拟合（可并行不同卡）
-EXPERT=high CUDA_VISIBLE_DEVICES=0 bash a2v/run_overfit.sh wan2.2-i2v-a14b
-EXPERT=low  CUDA_VISIBLE_DEVICES=1 bash a2v/run_overfit.sh wan2.2-i2v-a14b
+EXPERT=high CUDA_VISIBLE_DEVICES=0 bash a2v/train.sh wan2.2-i2v-a14b
+EXPERT=low  CUDA_VISIBLE_DEVICES=1 bash a2v/train.sh wan2.2-i2v-a14b
 # 合并因果门
 HI=models/train/a2v_robotwin_ep0_vace_a14b_high/step-1000.safetensors
 LO=models/train/a2v_robotwin_ep0_vace_a14b_low/step-1000.safetensors
@@ -833,7 +833,7 @@ CUDA_VISIBLE_DEVICES=0 $PY -m a2v.eval_multiep --base_spec wan2.2-i2v-a14b --lor
 - `infer_a2v.py`：**关键修复**——from_pretrained 载入的预训练 vace/vace2 受 vram 管理（wrapped → state_dict 键带 `.module.`），
   标准 vace ckpt 无法 `load_state_dict`（报 unexpected keys）。推理时对预训练分支改为 **build_bare_vace 建裸分支 + 载训练 ckpt + 钉 GPU**
   （与 from-DiT 路同样的 un-managed 常驻 GPU 终态；DiT 仍 offload）。
-- `run_overfit.sh`：加 `wan2.2-vace-fun-a14b` case（`FIRST_FRAME=reference`、full-param vace、adam8bit、lr1e-5、`EXPERT=high|low` 带边界）。
+- `train.sh`：加 `wan2.2-vace-fun-a14b` case（`FIRST_FRAME=reference`、full-param vace、adam8bit、lr1e-5、`EXPERT=high|low` 带边界）。
 - `check_load.py`：双预训练 smoke（校验 vace + vace2 都预训练存在）。
 
 ### 19.3 训练（同 T6 配方：单 ep ep0_dataset_phys 240×320，full-param vace，8-bit Adam，lr1e-5，1000 步/专家）
@@ -874,8 +874,8 @@ cd /vepfs/wangshilong/code/DiffSynth-Studio; PY=.venv/bin/python
   --exclude 'models_t5_umt5-xxl-enc-bf16.pth' 'Wan2.1_VAE.pth' 'google/*' \
   --local_dir models/PAI/Wan2.2-VACE-Fun-A14B
 CUDA_VISIBLE_DEVICES=0 $PY -m a2v.check_load --base_spec wan2.2-vace-fun-a14b
-EXPERT=high CUDA_VISIBLE_DEVICES=0 bash a2v/run_overfit.sh wan2.2-vace-fun-a14b
-EXPERT=low  CUDA_VISIBLE_DEVICES=1 bash a2v/run_overfit.sh wan2.2-vace-fun-a14b
+EXPERT=high CUDA_VISIBLE_DEVICES=0 bash a2v/train.sh wan2.2-vace-fun-a14b
+EXPERT=low  CUDA_VISIBLE_DEVICES=1 bash a2v/train.sh wan2.2-vace-fun-a14b
 HI=models/train/a2v_robotwin_ep0_vace_funa14b_high/step-1000.safetensors
 LO=models/train/a2v_robotwin_ep0_vace_funa14b_low/step-1000.safetensors
 for c in real none shuffle; do CUDA_VISIBLE_DEVICES=0 $PY -m a2v.infer_a2v --base_spec wan2.2-vace-fun-a14b \
@@ -915,14 +915,14 @@ pixel fidelity, so a strong-first-frame i2v/ti2v base is the right production ch
 ### 20.3 Pre-encode + train (encoded-cache, S17 path)
 - Pre-encode once, 8-GPU sharded `--task sft:data_process` -> `cache_wm_ti2v_480` (~377GB; the cache
   also stores raw inputs alongside the encoded tensors, hence large).
-- Train `run_overfit.sh` (extended with `CACHE_TRAIN=/CACHE_DIR=/RESUME=`): 8-GPU DDP cache-train,
+- Train `train.sh` (extended with `CACHE_TRAIN=/CACHE_DIR=/RESUME=`): 8-GPU DDP cache-train,
   from-DiT full-param vace, 8-bit Adam, lr 1e-5, 30 epochs (~10140 steps), save_steps 500, ~37GB/GPU,
   ~2.1s/it (~7h). Loss 0.49 -> last100 mean 0.13 (diverse set; not single-sample memorization).
   ckpt `models/train/a2v_wm_ti2v_480/step-10140.safetensors` (5.2GB, from-DiT vace).
 - **Two cache-train fixes (TI2V-specific vs the I2V cache path in S17):**
   (1) `WanVideoUnit_NoiseInitializer` reads `pipe.vae.model.z_dim`/`upsampling_factor`, so cache-train
   must keep the (small) VAE loaded, not only the DiT (`train_a2v` now loads DiT+VAE in cache mode).
-  (2) the encoder units only prune when the task ends `:train`; `run_overfit.sh` cache mode passes
+  (2) the encoder units only prune when the task ends `:train`; `train.sh` cache mode passes
   `--task sft:train` (the default `sft` left the T5 text-encoder unit running against a None encoder).
 
 ### 20.4 Held-out gate (eval_multiep, 2 rows/variant = 12 rows, step-10140)
@@ -949,7 +949,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 .venv/bin/accelerate launch --num_processes
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 SPEC=wan2.2-ti2v-5b CACHE_TRAIN=1 \
   CACHE_DIR=.cache/a2v_robotwin/cache_wm_ti2v_480 NPROC=8 HEIGHT=480 WIDTH=640 FRAMES=49 \
   LR=1e-5 REPEAT=1 EPOCHS=30 SAVE_STEPS=500 OUT=models/train/a2v_wm_ti2v_480 \
-  bash a2v/run_overfit.sh wan2.2-ti2v-5b
+  bash a2v/train.sh wan2.2-ti2v-5b
 CK=models/train/a2v_wm_ti2v_480/step-10140.safetensors
 CUDA_VISIBLE_DEVICES=0 .venv/bin/python -m a2v.eval_multiep --base_spec wan2.2-ti2v-5b --lora $CK \
   --dataset .cache/a2v_robotwin/wm_480_heldout --rows 0,1,50,51,100,101,150,151,200,201,250,251 \

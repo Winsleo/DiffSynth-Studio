@@ -46,7 +46,7 @@ NEG_PROMPT = (
 def _load_vace_weights(pipe, vace, ckpt_path: str, lora_alpha: float) -> None:
     """Load a trained VACE checkpoint into `vace`, auto-detecting its kind.
 
-    Two training regimes produce different checkpoints (see a2v/run_overfit*.sh):
+    Two training regimes produce different checkpoints (see a2v/train.sh):
       * LoRA-on-VACE (T1/T2, pretrained vace) -> keys contain ``lora_A``/``lora_B`` ->
         merged via ``pipe.load_lora``.
       * Full-param VACE (T3, from-DiT vace) -> a complete vace state dict

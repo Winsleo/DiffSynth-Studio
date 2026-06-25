@@ -4,7 +4,11 @@
 > 这件事的目标、已核实事实、已产出文档、当前代码状态、以及待办与阻塞点。
 > 详细内容散在 `.cache/analysis/` 的各专题文档里，本文给出索引与摘要。
 
-最后更新：2026-06-24（T6 A14B 五基模收官；+ Fun-A14B warm-start 对照 §19）。
+最后更新：2026-06-25（首个正式 World Model §20；训练入口脚本 `run_overfit.sh` 重命名为 **`train.sh`**）。
+
+> **⚠ 入口改名（2026-06-25）**：统一训练脚本 `a2v/run_overfit.sh` → **`a2v/train.sh`**（名字不再误导,
+> 它早已是所有训练的统一入口,非仅 overfit）。用法不变:`bash a2v/train.sh <base_spec> [env...]`。
+> 用户上手先读 `a2v/README_A2V.md`(已重写为规范的使用指南)。下文历史段里的 `run_overfit.sh`/`run_overfit_<x>.sh` 均指今天的 `train.sh`。
 
 > ## ⭐ 接手清单（新会话先读这一段）
 > **🌍 首个正式 A2V World Model PASS（2026-06-24，§20）**：Wan2.2-TI2V-5B、**多任务多机器人、~480p**。
@@ -13,7 +17,7 @@
 > encoded-cache 8 卡 DDP、from-DiT 全参 vace、lr1e-5、30 epoch(~10140 步,~7h,~37GB/卡)，ckpt
 > `models/train/a2v_wm_ti2v_480/step-10140.safetensors`。**held-out 门 PASS：12/12（全 6 变体）real<none，REAL MAE-GT 7.24 ≪ NONE 17.35，motion×1.03**；
 > 目视 held-out REAL 复现场景+臂位、NONE 发散。新工具 `a2v/data/build_dataset.sh`（多变体并行建集+合并+validate）、
-> `prepare.py --skip_short`、`run_overfit.sh CACHE_TRAIN/CACHE_DIR/RESUME`。**两个 cache-train 修复**：cache 模式要载 VAE（NoiseInitializer 读 vae 配置）+ 必须 `--task sft:train`（剪掉 T5 等编码器单元）。详见 `A2V_HISTORY.md §20`。
+> `prepare.py --skip_short`、`train.sh CACHE_TRAIN/CACHE_DIR/RESUME`。**两个 cache-train 修复**：cache 模式要载 VAE（NoiseInitializer 读 vae 配置）+ 必须 `--task sft:train`（剪掉 T5 等编码器单元）。详见 `A2V_HISTORY.md §20`。
 >
 
 > **🏁 T6 Wan2.2-I2V-A14B PASS（2026-06-22）——五基模全部打通。** master plan 最后一个基模，SEAM-5 双专家 MoE
@@ -22,7 +26,7 @@
 > 走 VAE-concat，**无 CLIP**）。只下载两套 DiT 专家分片（107GB；VAE/T5/tokenizer 复用 converted）。
 > 单样本因果门 **REAL MAE-GT=3.14（五基模最佳）**、motion 4.97≈GT 4.78、NONE 21.48/SHUFFLE 20.48、切换不撕裂。
 > ckpt：`models/train/a2v_robotwin_ep0_vace_a14b_{high,low}/step-1000.safetensors`。
-> 配方：`EXPERT=high|low CUDA_VISIBLE_DEVICES=<g> bash a2v/run_overfit.sh wan2.2-i2v-a14b`（跑两次）；
+> 配方：`EXPERT=high|low CUDA_VISIBLE_DEVICES=<g> bash a2v/train.sh wan2.2-i2v-a14b`（跑两次）；
 > 推理：`a2v.infer_a2v --base_spec wan2.2-i2v-a14b --lora <high> --lora_low <low>`（双专家自动开 CPU offload）。详见 `A2V_HISTORY.md §18`。
 >
 > **Warm-start 对照 PASS（2026-06-24，§19）**：`PAI/Wan2.2-VACE-Fun-A14B` 自带预训练双 VACE（in_dim16 T2V 式 DiT +
@@ -44,12 +48,12 @@
 > **Multi-episode I2V-14B 已训练/PASS（2026-06-21，8 卡 DDP）**：train=ep0-39，held-out=ep40-49，105 帧，240x320。
 > final ckpt（全参 vace）：`models/train/a2v_robotwin_train40_vace_i2v/step-800.safetensors`。
 > **held-out：REAL MAE-GT=4.25、NONE=30.09、real<none=10/10、motion ratio=1.06、real-vs-none=30.21，PASS**（比 1.3B 更强、与 train 几乎无 gap）。
-> 配方 `NPROC=8 FRAMES=105 LR=1e-5 REPEAT=4 EPOCHS=40 bash a2v/run_overfit.sh wan2.1-i2v-14b-480p`（800 步~2.2h）。评测：`.cache/a2v_robotwin/eval_heldout_i2v/`。详见 `A2V_HISTORY.md §16`。
+> 配方 `NPROC=8 FRAMES=105 LR=1e-5 REPEAT=4 EPOCHS=40 bash a2v/train.sh wan2.1-i2v-14b-480p`（800 步~2.2h）。评测：`.cache/a2v_robotwin/eval_heldout_i2v/`。详见 `A2V_HISTORY.md §16`。
 >
 > **Multi-episode VACE-1.3B PASS（2026-06-18）**：同数据 LoRA `models/train/a2v_robotwin_train40_vace1p3b_lora/step-4800.safetensors`；
 > held-out REAL=6.25/NONE=26.83/10-10/PASS。详见 `A2V_HISTORY.md §15`。
 >
-> **工具**：`a2v.eval_multiep --base_spec <s> --lora <ckpt> --dataset <heldout> --controls real,none` 多行泛化评测（模型只加载一次、per-row 容错、聚合判定 + metrics.json）。`run_overfit.sh` 支持 `NPROC=`（多卡 DDP）+ `REPEAT/EPOCHS/FRAMES`（多 ep 配方），默认仍是单卡单 ep 过拟合。
+> **工具**：`a2v.eval_multiep --base_spec <s> --lora <ckpt> --dataset <heldout> --controls real,none` 多行泛化评测（模型只加载一次、per-row 容错、聚合判定 + metrics.json）。`train.sh` 支持 `NPROC=`（多卡 DDP）+ `REPEAT/EPOCHS/FRAMES`（多 ep 配方），默认仍是单卡单 ep 过拟合。
 > **encoded-cache**：`--task sft:data_process` 先预编码（每 episode 存 `.pth`），再 `--cache_train --task sft:train --dataset_base_path <cache_dir>` 训练（只载 DiT、跳过编码器）。换分辨率/重渲数据后必须换缓存目录。详见 `A2V_HISTORY.md §17`。
 >
 > **T5 (Wan2.2-TI2V-5B) 已打通/PASS（2026-06-16）**：SEAM-2 新 VAE 路径可用。
@@ -61,7 +65,7 @@
 > 若日后重装 deepspeed 又遇 nvcc 探测崩溃，最简办法是再次卸载它（A2V 单卡 8-bit + 低 lr 不需要 deepspeed）。8 张 A100 可用。
 >
 > **🧹 代码整理（2026-06-17，中度统一）**：
-> - **训练脚本合并**：`run_overfit_{t2v,i2v,ti2v}.sh` → 统一 **`bash a2v/run_overfit.sh <base_spec>`**（按 spec 自带 lr/数据集/H×W/优化器/首帧/LoRA-vs-全参预设；env `LR=/OUT=/HEIGHT=/...` 可覆盖）。下文历史段里出现的 `run_overfit_<x>.sh` 一律等价于 `run_overfit.sh <对应 spec>`。
+> - **训练脚本合并**：`run_overfit_{t2v,i2v,ti2v}.sh` → 统一 **`bash a2v/train.sh <base_spec>`**（按 spec 自带 lr/数据集/H×W/优化器/首帧/LoRA-vs-全参预设；env `LR=/OUT=/HEIGHT=/...` 可覆盖）。下文历史段里出现的 `run_overfit_<x>.sh` 一律等价于 `train.sh <对应 spec>`。
 > - **加载冒烟合并**：`check_t4_load.py`/`check_t5_load.py` → 统一 **`a2v.check_load --base_spec <spec>`**。
 > - **删除废弃产物**：`a2v/.fakecuda/`、`run_overfit_i2v_fp32.sh`、`accelerate_2gpu_zero2.yaml`（fp32 多卡弯路已废弃，历史见 §13.1）。
 > - `causal_metrics` 的 `--height/--width` 改为可选，默认从 GT PNG 自动派生（避免 T5 256 vs 默认 240 的形状错）。
@@ -80,7 +84,7 @@
 > $PY -m a2v.check_load --base_spec wan2.2-ti2v-5b
 > $PY -m a2v.check_provision --base_spec wan2.2-ti2v-5b \
 >   --dataset .cache/a2v_robotwin/ep0_dataset_phys_256x320 --height 256 --width 320 --num_frames 13 --steps 4
-> CUDA_VISIBLE_DEVICES=<g> bash a2v/run_overfit.sh wan2.2-ti2v-5b
+> CUDA_VISIBLE_DEVICES=<g> bash a2v/train.sh wan2.2-ti2v-5b
 > for c in real none shuffle; do $PY -m a2v.infer_a2v --base_spec wan2.2-ti2v-5b \
 >   --dataset .cache/a2v_robotwin/ep0_dataset_phys_256x320 \
 >   --lora models/train/a2v_robotwin_ep0_vace_ti2v/step-1000.safetensors \
@@ -98,7 +102,7 @@
 > | **lr1e5** | **1e-5** | `models/train/a2v_robotwin_ep0_vace_i2v_lr1e5` | **4.83** | **4.94** | **36.04** | **36.79** |
 > | lr2e5 | 2e-5 | `models/train/a2v_robotwin_ep0_vace_i2v_lr2e5` | 5.19 | 4.97 | 37.80 | 38.62 |
 > 视频：`.cache/a2v_robotwin/gen_i2v_lr{5e6,1e5,2e5}_s1000_{real,none}.mp4`。
-> 复现/覆盖：`LR=<lr> OUT=<dir> CUDA_VISIBLE_DEVICES=<g> bash a2v/run_overfit.sh wan2.1-i2v-14b-480p`（默认 `LR=1e-5`）。
+> 复现/覆盖：`LR=<lr> OUT=<dir> CUDA_VISIBLE_DEVICES=<g> bash a2v/train.sh wan2.1-i2v-14b-480p`（默认 `LR=1e-5`）。
 >
 > **下一步（择一，T6 后；master plan 五基模已收官）**：① **A14B 多 episode 泛化**（复用 `eval_multiep --lora_low`、train40/heldout10、encoded-cache）；② 更大规模多 ep（更多 episode / 多 task 混训）；③ `Wan2.2-VACE-Fun-A14B` 自带双 VACE warm-start 对照；④ 编码升级（splat）；⑤ 进一步降显存（DiT 本体需 ZeRO-3/FSDP 分片）。见 §5/§4.2 与 `A2V_HISTORY.md §15/§16/§17/§18`。
 > **已完成**：**T1–T6 单 ep 全 PASS（五基模收官）**；多 ep 泛化 VACE-1.3B(§15) + I2V-14B(§16) 均 PASS；encoded-cache 提速/降显存(§17)；T6 A14B 双专家 MoE(§18)。
@@ -198,13 +202,13 @@ P=Q **必须等于 VAE 空间压缩因子**（否则崩）——这是 master pl
 | `vace_unit.py` | **[T2]** `ParamWanVideoUnit_VACE`(参数化 mask_pq)+`install_vace_unit`(§8) |
 | `provision.py` | **[T2/T3]** `ensure_vace`(SEAM-1,幂等)+`provision_a2v`+`create_vace_from_dit`(从 DiT 造 VACE,只 zero-init after_proj,§11) |
 | `check_provision.py` | **[T3/T4/T5]** SEAM-1 退出门:形状/零副作用/结构 parity(§11);I2V/TI2V 传 `input_image`(§12/§14) |
-| `run_overfit.sh` | **[统一,06-17]** `bash a2v/run_overfit.sh <base_spec>` 单样本过拟合,按 spec 自带预设(lr/数据集/H×W/优化器/首帧/LoRA-vs-全参)。取代 run_overfit_{t2v,i2v,ti2v}.sh |
+| `train.sh` | **[统一,06-17]** `bash a2v/train.sh <base_spec>` 单样本过拟合,按 spec 自带预设(lr/数据集/H×W/优化器/首帧/LoRA-vs-全参)。取代 run_overfit_{t2v,i2v,ti2v}.sh |
 | `check_load.py` | **[统一,06-17]** `--base_spec` 加载冒烟(取代 check_t4_load/check_t5_load):DiT层数/VAE z·s/造 vace(in_dim·层数·after_proj=0)/mask_pq;i2v 验 CLIP+in_dim36,ti2v 验 in_dim48+fused |
 | `causal_metrics.py` | **[可复用]** 因果门度量 MAE-GT/motion/real-vs-none;H,W 默认从 GT PNG 自动派生(§12) |
 | `train_a2v.py` | **[T1/T2/T5]** 薄训练封装(swap operator)+`--base_spec`+`provision_a2v`；按 spec 派生数据整除因子 |
 | `infer_a2v.py` | **[T1/T2/T4/T5]** 推理 harness;`--base_spec`/`--control real\|none\|shuffle`；I2V/TI2V 首帧走 `input_image`；现抽出可 import 的 build/generate 函数供多行评测复用 |
 | `eval_multiep.py` | **[M1]** 多 episode 泛化评测；模型只加载一次，逐行生成 real/none，输出 mp4 + metrics.json + SUMMARY |
-| `run_overfit.sh` | **[T1/T2]** 单样本 LoRA 过拟合(spec 驱动) |
+| `train.sh` | **[T1/T2]** 单样本 LoRA 过拟合(spec 驱动) |
 | `check_parity.py` | **[T2]** 零行为变更对拍闸门(§8) |
 | `README_A2V.md` | 用法 + 训练接线前向依赖 + reference 帧语义 |
 
@@ -220,7 +224,7 @@ P=Q **必须等于 VAE 空间压缩因子**（否则崩）——这是 master pl
 | T2 抽象插入(`WanBaseSpec`) | ✅ PASS | 零行为变更已对拍(MD5 一致)。详见 §8 |
 | §9 半径修复端到端重验 | ✅ PASS (06-13) | physical 重渲染+重训+因果门(REAL MAE 9.2/NONE 静止);并修复 T2 LoRA 前缀 bug。详见 §10 |
 | T3 接入 T2V-1.3B | ✅ PASS (06-14) | SEAM-1「从 DiT 造 VACE」。3 道 provision 门 + 全参过拟合因果门(REAL MAE-GT 20.9/NONE 静止 0.68/real-none 41.6)。**关键纠错:LoRA 不可训 from-DiT vace,且 patch_embedding 不可与 before_proj 同时零初始化(死锁)**。详见 §11 |
-| **T4 接入 I2V-14B** | ✅ **PASS/定稿** (06-16) | 真因=**lr 1e-4 过高**(非 8-bit Adam/非缺 vace_reference)。三组 step-1000 lr 扫描完成，**lr1e5 胜出**:REAL MAE-GT **4.83**、motion 4.94≈GT 4.78、NONE MAE-GT 36.04、real-none 36.79。`run_overfit.sh` 默认已改 `1e-5`。详见 §12/§13 |
+| **T4 接入 I2V-14B** | ✅ **PASS/定稿** (06-16) | 真因=**lr 1e-4 过高**(非 8-bit Adam/非缺 vace_reference)。三组 step-1000 lr 扫描完成，**lr1e5 胜出**:REAL MAE-GT **4.83**、motion 4.94≈GT 4.78、NONE MAE-GT 36.04、real-none 36.79。`train.sh` 默认已改 `1e-5`。详见 §12/§13 |
 | **T5 接入 TI2V-5B** | ✅ **PASS** (06-16) | SEAM-2 新 VAE 打通：`vace_in_dim=352`/`mask_pq=16`，256×320 数据、load/provision/1000步过拟合/real-none-shuffle 因果门全过。REAL MAE-GT **5.27**，NONE 15.62，SHUFFLE 14.91。详见 §14 |
 | **M1 VACE-1.3B 多 episode** | ✅ **PASS** (06-18) | train40/heldout10，105 帧，240x320，LoRA step-4800。held-out REAL MAE-GT **6.25** vs NONE **26.83**，real<none **10/10**，motion ratio **1.03**。详见 §15 |
 | **T6 接入 I2V-A14B** | ✅ **PASS** (06-22) | SEAM-5 双专家 MoE。两条独立单专家作业分带训练（high `[0,0.358]`/low `[0.358,1]`），新 SEAM-4 `i2v_vae`(无 CLIP)，from-DiT 全参 vace。推理原生切换(0.875)+双专家 CPU offload。单 ep 因果门 **REAL MAE-GT 3.14**(五基模最佳)/NONE 21.48/SHUFFLE 20.48/motion×1.04/不撕裂。详见 §18 |
@@ -241,7 +245,7 @@ cd /vepfs/wangshilong/code/DiffSynth-Studio
 
 **新半径可用产物（06-13 验证，直接可用，无需任何手工后处理）：**
 - 数据集 `.cache/a2v_robotwin/ep0_dataset_phys`；LoRA `models/train/a2v_robotwin_ep0_lora_phys/step-1000.fixedkeys.safetensors`。
-- `run_overfit.sh` 默认已指向 `ep0_dataset_phys`；`train_a2v` 前缀 bug 已修，**重训原生产出可加载 key**（`vace_blocks.*`）。
+- `train.sh` 默认已指向 `ep0_dataset_phys`；`train_a2v` 前缀 bug 已修，**重训原生产出可加载 key**（`vace_blocks.*`）。
 - ⚠ 同目录的原始 `step-1000.safetensors`（及 step-100..900）是**坏前缀**(`pipe.vace.*`)产物，**勿用**；只用 `*.fixedkeys.safetensors` 或重训。
 
 > 第一阶段 REVIEW_FIXES.md 的 T1–T7 早已逐文件核实落实。

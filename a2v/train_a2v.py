@@ -12,7 +12,7 @@ swap in ``a2v.data.operators.frame_list_video_operator``, which adds the
 Everything else — model loading, VACE branch selection, LoRA, the loss, the
 launcher — is the stock code, imported unchanged.
 
-Run via ``accelerate launch -m a2v.train_a2v ...`` (see ``a2v/run_overfit.sh``).
+Run via ``accelerate launch -m a2v.train_a2v ...`` (see ``a2v/train.sh``).
 """
 
 from __future__ import annotations
@@ -84,7 +84,7 @@ def main() -> None:
                         help="SEAM-5 dual-expert MoE (A14B): which expert this job trains. "
                              "Selects that expert's DiT via spec.model_paths(expert=...) and "
                              "should be paired with the matching --min/--max_timestep_boundary "
-                             "band (see run_overfit.sh). Ignored for single-expert specs.")
+                             "band (see train.sh). Ignored for single-expert specs.")
     parser.add_argument("--cache_train", action="store_true",
                         help="Train from a pre-encoded cache (built with --task sft:data_process). "
                              "Loads ONLY the DiT (T5/VAE/CLIP outputs come from the cache, so those "

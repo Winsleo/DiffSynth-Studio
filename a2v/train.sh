@@ -1,46 +1,48 @@
 #!/usr/bin/env bash
-# A2V single-sample overfit ("去留闸门") for ANY registered Wan base model.
+# A2V training entry. One driver for every registered Wan base model and every scale:
+# single-episode overfit, multi-episode, and pre-encoded cache-train. It wraps
+# `python -m a2v.train_a2v` (via `accelerate launch`) and fills per-base presets
+# (dataset / resolution / lr / optimizer / first-frame / LoRA-vs-full-param) from the spec.
 #
-#   Usage:  bash a2v/run_overfit.sh <base_spec>
+#   Usage:  bash a2v/train.sh <base_spec>   [env overrides...]
 #
-#   <base_spec> is one of (a2v/base_spec.py REGISTRY):
-#     wan2.1-vace-1.3b     T1  pretrained VACE  -> LoRA            (reference first-frame)
-#     wan2.1-t2v-1.3b      T3  from-DiT VACE    -> full-param vace (reference first-frame)
-#     wan2.1-i2v-14b-480p  T4  from-DiT VACE    -> full-param vace (i2v_concat first-frame)
-#     wan2.2-ti2v-5b       T5  from-DiT VACE    -> full-param vace (ti2v_fused first-frame)
-#     wan2.2-i2v-a14b      T6  from-DiT VACE    -> full-param vace (i2v_vae first-frame),
-#                              SEAM-5 dual-expert MoE: run TWICE with EXPERT=high then
-#                              EXPERT=low (each trains one expert on its timestep band).
-#     wan2.2-vace-fun-a14b warm-start: PRETRAINED dual VACE (Fun-A14B), vace_reference
-#                              first-frame; same EXPERT=high|low dual-job pattern as above.
+#   <base_spec> (a2v/base_spec.py REGISTRY):
+#     wan2.1-vace-1.3b      pretrained VACE  -> LoRA            (vace_reference first frame)
+#     wan2.1-t2v-1.3b       from-DiT VACE    -> full-param vace (vace_reference first frame)
+#     wan2.1-i2v-14b-480p   from-DiT VACE    -> full-param vace (i2v_concat first frame)
+#     wan2.2-ti2v-5b        from-DiT VACE    -> full-param vace (ti2v_fused first frame)
+#     wan2.2-i2v-a14b       from-DiT VACE    -> full-param vace (i2v_vae first frame); dual-
+#                           expert MoE: run twice, EXPERT=high then EXPERT=low.
+#     wan2.2-vace-fun-a14b  pretrained dual VACE (warm-start), vace_reference first frame;
+#                           dual-expert MoE, same EXPERT=high|low two-run pattern.
 #
-# Why the presets differ (set per base below; override any with env vars):
-#   * first frame: reference bases feed `vace_reference_image`; i2v/ti2v feed `input_image`
-#     (the stock trainer derives it from video[0]) — these are alternatives, never both.
-#   * train mode: a pretrained VACE branch trains via LoRA; a from-DiT branch MUST train
-#     full-param (`--trainable_models vace`) — its zero-init control entry/exit
-#     (vace_patch_embedding / after_proj) are not LoRA targets, so a LoRA there is inert.
-#   * optimizer: 1.3B uses fp32 AdamW + gradient-checkpointing offload; 14B/5B use 8-bit
-#     Adam so the optimizer state fits one 80GB GPU (lr 1e-5 — 1e-4 diverged on 14B, §13).
-#   * resolution: TI2V's Wan2.2 VAE is 16x spatial x patch 2 = 32x, so H,W must be /32 ->
-#     use the 256x320 dataset (240 is not divisible by 32).
+# Modes:
+#   default       train from the raw PNG dataset (DATASET=); encoders run each step.
+#   CACHE_TRAIN=1 train from a pre-encoded cache (CACHE_DIR=); loads only DiT(+VAE), skips
+#                 T5/CLIP -> faster + less VRAM. Build the cache once with:
+#                   accelerate launch -m a2v.train_a2v --base_spec <spec> --task sft:data_process \
+#                     --dataset_base_path <DATA> --dataset_metadata_path <DATA>/metadata.jsonl ...
 #
-# Env overrides:  LR=  DATASET=  OUT=  HEIGHT=  WIDTH=  FRAMES=  REPEAT=  EPOCHS=  NPROC=  DRY_RUN=1
-#   wan2.2-i2v-a14b / wan2.2-vace-fun-a14b:  EXPERT=high|low (REQUIRED) selects the MoE expert + timestep band.
+# Env overrides (defaults are per-base presets unless set):
+#   SPEC=  DATASET=  OUT=  LR=  HEIGHT=  WIDTH=  FRAMES=  REPEAT=  EPOCHS=  SAVE_STEPS=
+#   NPROC=        data-parallel GPUs (DDP); default 1
+#   CACHE_TRAIN=1 CACHE_DIR=   train from an encoded cache (see Modes)
+#   RESUME=<ckpt>             resume a long run
+#   EXPERT=high|low           REQUIRED for the dual-expert A14B specs (selects expert+band)
+#   DRY_RUN=1                 print the resolved command without launching
 #
-# Causal gate afterwards (real reconstructs GT; none/shuffle do not):
-#   for c in real none; do .venv/bin/python -m a2v.infer_a2v --base_spec <base_spec> \
-#     --dataset <DATASET> --lora <OUT>/step-1000.safetensors \
-#     --height <H> --width <W> --num_frames 121 --control $c \
-#     --output .cache/a2v_robotwin/gen_$c.mp4; done
-#   .venv/bin/python -m a2v.causal_metrics --dataset <DATASET> \
-#     --real .cache/a2v_robotwin/gen_real.mp4 --none .cache/a2v_robotwin/gen_none.mp4
+# Why presets differ: from-DiT VACE must train full-param (its zero-init control entry/exit
+# are not LoRA targets); 14B/5B use 8-bit Adam to fit one 80GB GPU (lr 1e-5; 1e-4 diverged on
+# 14B); TI2V's Wan2.2 VAE is 32x (16x spatial x patch 2) so its H,W must be divisible by 32.
+#
+# After training, run the causal gate (see README_A2V.md S3): infer real/none/shuffle, then
+# `python -m a2v.causal_metrics` (single ep) or `python -m a2v.eval_multiep` (multi ep).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 SPEC="${1:-}"
 if [ -z "$SPEC" ]; then
-  echo "usage: bash a2v/run_overfit.sh <base_spec>"
+  echo "usage: bash a2v/train.sh <base_spec>"
   echo "  base_spec: wan2.1-vace-1.3b | wan2.1-t2v-1.3b | wan2.1-i2v-14b-480p | wan2.2-ti2v-5b | wan2.2-i2v-a14b | wan2.2-vace-fun-a14b"
   echo "  (wan2.2-i2v-a14b / wan2.2-vace-fun-a14b require EXPERT=high|low)"
   exit 1
@@ -157,7 +159,7 @@ case "$SPEC" in
 esac
 
 SRC_DESC=$([ "$CACHE_TRAIN" = "1" ] && echo "cache=$CACHE_DIR" || echo "dataset=$DATASET")
-echo "[run_overfit] spec=$SPEC $SRC_DESC out=$OUT ${HEIGHT}x${WIDTH} frames=$FRAMES repeat=$REPEAT epochs=$EPOCHS nproc=$NPROC lr=$LR mode=$TRAIN_MODE opt=$OPTIMIZER first_frame=$FIRST_FRAME${EXPERT_ARGS:+ expert=$EXPERT band=[$MIN_TS,$MAX_TS]}${RESUME:+ resume=$RESUME}"
+echo "[train] spec=$SPEC $SRC_DESC out=$OUT ${HEIGHT}x${WIDTH} frames=$FRAMES repeat=$REPEAT epochs=$EPOCHS nproc=$NPROC lr=$LR mode=$TRAIN_MODE opt=$OPTIMIZER first_frame=$FIRST_FRAME${EXPERT_ARGS:+ expert=$EXPERT band=[$MIN_TS,$MAX_TS]}${RESUME:+ resume=$RESUME}"
 
 CMD=(.venv/bin/accelerate launch --num_processes "$NPROC" --mixed_precision bf16 -m a2v.train_a2v \
   --base_spec "$SPEC" \
@@ -175,7 +177,7 @@ CMD=(.venv/bin/accelerate launch --num_processes "$NPROC" --mixed_precision bf16
   --enable_tensorboard_log
 )
 
-printf '[run_overfit] command:'
+printf '[train] command:'
 printf ' %q' "${CMD[@]}"
 printf '\n'
 if [ "$DRY_RUN" = "1" ]; then
