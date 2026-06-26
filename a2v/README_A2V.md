@@ -91,6 +91,44 @@ TASKS="beat_block_hammer adjust_bottle" ROBOTS="aloha-agilex franka ur5" \
 # -> .cache/a2v_robotwin/wm_480_{train,heldout}
 ```
 
+### Input data contract (using your own robot data)
+
+`robotwin_adapter` is RoboTwin-specific. For any other source, produce the same inputs
+`prepare` consumes — per episode, the **source video** + three `.npy` files, plus one
+manifest row:
+
+| input | shape / type | meaning |
+| --- | --- | --- |
+| source video | `.mp4` (or readable frames) | one frame per timestep, **frame-aligned** with the actions |
+| `actions.npy` | `(T, 16)` float | both arms: `[Lxyz, Lquat(xyzw), Lgrip, Rxyz, Rquat(xyzw), Rgrip]` (gripper in [0,1], ×120 for the colormap) |
+| `intrinsic.npy` | `(3, 3)` float | OpenCV camera intrinsics `K` |
+| `extrinsic.npy` | `(T, 4, 4)` float | **camera-to-world (c2w)** per frame |
+
+Manifest (`metadata.jsonl`), one JSON object per line:
+
+```json
+{
+  "id": "unique_name",                 // becomes the episode output subdir
+  "video": "/path/episode.mp4",        // REQUIRED
+  "action_path": "/path/actions.npy",  // REQUIRED  (T,16)
+  "intrinsic_path": "/path/intrinsic.npy",  // REQUIRED (3,3)
+  "extrinsic_path": "/path/extrinsic.npy",  // REQUIRED (T,4,4) c2w
+  "original_size": [H, W],             // source video resolution (validated; must match)
+  "prompt": "task instruction text",   // optional
+  "total_frames": T                    // optional (auto-read from the video if omitted)
+}
+```
+
+Conventions that must hold (otherwise the projection misaligns):
+- `extrinsic` is **c2w**. RoboTwin stores world-to-camera (w2c) and `robotwin_adapter`
+  inverts it; if your poses are already c2w, do not invert again.
+- `original_size` must equal the real video resolution (intrinsics are scaled to the
+  training `--height/--width` from it).
+- End-effector poses are **TCP-framed** → `--gripper_z_offset 0`. Quaternions are **xyzw**.
+  `video` and `actions` share one timeline (frame `t` ↔ action `t`).
+
+Then run `a2v.data.prepare` on your manifest exactly as above.
+
 ---
 
 ## 2. Train — `a2v/train.sh`
