@@ -32,13 +32,22 @@
 #   LR_SCHEDULE=constant|cosine   default constant; cosine = warmup -> cosine decay (LR = peak)
 #   WARMUP=<steps>            cosine warmup steps (0 -> 3% of total = num_epochs*len(dataset))
 #   LR_MIN_RATIO=<frac>       cosine final lr as a fraction of peak (default 0)
+#   LOGGER=tensorboard,...    comma list of logging backends: tensorboard|wandb|swanlab|none
+#                             (default tensorboard). WANDB_PROJECT/SWANLAB_PROJECT name the project.
+#   LOG_EVERY=<n>             log lr/grad_norm/throughput/gpu_mem every n steps (default 10)
+#   GRAD_NORM=0|1             log grad norm on logging steps (default 1)
+#   SAMPLE_EVERY=<n>          in-training generation cadence (0 = off). Reuses the live pipe;
+#                             auto-skipped for cache-train / dual-expert / cpu-offload. Clips +
+#                             tensorboard/wandb videos under <OUT>/samples/.
+#   SAMPLE_ROWS=  SAMPLE_CONTROLS=  SAMPLE_FRAMES=  SAMPLE_STEPS=   sampling detail (csv rows;
+#                             real|none|shuffle controls; frames 0->FRAMES; steps 0->50)
 #   DRY_RUN=1                 print the resolved command without launching
 #
 # Why presets differ: from-DiT VACE must train full-param (its zero-init control entry/exit
 # are not LoRA targets); 14B/5B use 8-bit Adam to fit one 80GB GPU (lr 1e-5; 1e-4 diverged on
 # 14B); TI2V's Wan2.2 VAE is 32x (16x spatial x patch 2) so its H,W must be divisible by 32.
 #
-# After training, run the causal gate (see README_A2V.md S3): infer real/none/shuffle, then
+# After training, run the causal gate (see README_A2V.md "Step 4"): infer real/none/shuffle, then
 # `python -m a2v.causal_metrics` (single ep) or `python -m a2v.eval_multiep` (multi ep).
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -113,7 +122,40 @@ RESUME="${RESUME:-}"              # checkpoint dir/file to resume from (long pro
 LR_SCHEDULE="${LR_SCHEDULE:-constant}"  # constant (default) | cosine (warmup -> cosine decay; LR = peak)
 WARMUP="${WARMUP:-0}"                    # cosine warmup steps; 0 -> 3% of total (num_epochs*len(dataset))
 LR_MIN_RATIO="${LR_MIN_RATIO:-0.0}"     # cosine final lr as a fraction of peak
+# ---- logging / observability (a2v.train_logging) ----
+LOGGER="${LOGGER:-tensorboard}"   # comma list: tensorboard,wandb,swanlab (or 'none'). default = tensorboard
+LOG_EVERY="${LOG_EVERY:-10}"      # log lr/grad_norm/throughput/gpu_mem every N steps (loss every step)
+GRAD_NORM="${GRAD_NORM:-1}"       # 1 = log grad norm (before zero_grad); 0 = skip
+SAMPLE_EVERY="${SAMPLE_EVERY:-0}" # periodic in-training generation cadence (0 = off)
+SAMPLE_ROWS="${SAMPLE_ROWS:-0}"   # dataset rows to sample, csv
+SAMPLE_CONTROLS="${SAMPLE_CONTROLS:-real}"  # causal controls to sample, csv: real|none|shuffle
+SAMPLE_FRAMES="${SAMPLE_FRAMES:-0}"         # frames per sample (0 -> FRAMES)
+SAMPLE_STEPS="${SAMPLE_STEPS:-0}"           # denoising steps per sample (0 -> pipeline default 50)
 DRY_RUN="${DRY_RUN:-0}"
+
+# logger selection -> stock --enable_*_log flags (cache mode has no step loop only for data_process)
+LOGGER_ARGS=()
+IFS=',' read -ra _LOGGERS <<< "$LOGGER"
+for _lg in "${_LOGGERS[@]}"; do
+  case "$_lg" in
+    tensorboard) LOGGER_ARGS+=(--enable_tensorboard_log) ;;
+    wandb)       LOGGER_ARGS+=(--enable_wandb_log) ;;
+    swanlab)     LOGGER_ARGS+=(--enable_swanlab_log) ;;
+    none|"")     : ;;
+    *) echo "unknown LOGGER token: '$_lg' (use tensorboard|wandb|swanlab|none)"; exit 1 ;;
+  esac
+done
+[ -n "${WANDB_PROJECT:-}" ]   && LOGGER_ARGS+=(--wandb_project "$WANDB_PROJECT")
+[ -n "${SWANLAB_PROJECT:-}" ] && LOGGER_ARGS+=(--swanlab_project "$SWANLAB_PROJECT")
+
+# scalar logging cadence + periodic sampling
+LOG_ARGS=(--log_every "$LOG_EVERY" --log_grad_norm "$GRAD_NORM")
+SAMPLE_ARGS=()
+if [ "$SAMPLE_EVERY" != "0" ]; then
+  SAMPLE_ARGS+=(--sample_every "$SAMPLE_EVERY" --sample_rows "$SAMPLE_ROWS"
+                --sample_controls "$SAMPLE_CONTROLS" --sample_num_frames "$SAMPLE_FRAMES"
+                --sample_steps "$SAMPLE_STEPS")
+fi
 
 # first-frame seam -> which inputs to feed (only used when encoding; cache mode skips encoders)
 if [ "$FIRST_FRAME" = "reference" ]; then
@@ -168,7 +210,7 @@ case "$SPEC" in
 esac
 
 SRC_DESC=$([ "$CACHE_TRAIN" = "1" ] && echo "cache=$CACHE_DIR" || echo "dataset=$DATASET")
-echo "[train] spec=$SPEC $SRC_DESC out=$OUT ${HEIGHT}x${WIDTH} frames=$FRAMES repeat=$REPEAT epochs=$EPOCHS nproc=$NPROC lr=$LR sched=$LR_SCHEDULE${LR_SCHEDULE:+$([ "$LR_SCHEDULE" = cosine ] && echo " warmup=$WARMUP min_ratio=$LR_MIN_RATIO")} mode=$TRAIN_MODE opt=$OPTIMIZER first_frame=$FIRST_FRAME${EXPERT_ARGS:+ expert=$EXPERT band=[$MIN_TS,$MAX_TS]}${RESUME:+ resume=$RESUME}"
+echo "[train] spec=$SPEC $SRC_DESC out=$OUT ${HEIGHT}x${WIDTH} frames=$FRAMES repeat=$REPEAT epochs=$EPOCHS nproc=$NPROC lr=$LR sched=$LR_SCHEDULE${LR_SCHEDULE:+$([ "$LR_SCHEDULE" = cosine ] && echo " warmup=$WARMUP min_ratio=$LR_MIN_RATIO")} mode=$TRAIN_MODE opt=$OPTIMIZER first_frame=$FIRST_FRAME${EXPERT_ARGS:+ expert=$EXPERT band=[$MIN_TS,$MAX_TS]}${RESUME:+ resume=$RESUME} logger=$LOGGER log_every=$LOG_EVERY${SAMPLE_ARGS:+ sample_every=$SAMPLE_EVERY rows=$SAMPLE_ROWS controls=$SAMPLE_CONTROLS steps=$SAMPLE_STEPS}"
 
 CMD=(.venv/bin/accelerate launch --num_processes "$NPROC" --mixed_precision bf16 -m a2v.train_a2v \
   --base_spec "$SPEC" \
@@ -184,7 +226,9 @@ CMD=(.venv/bin/accelerate launch --num_processes "$NPROC" --mixed_precision bf16
   --save_steps "$SAVE_STEPS" \
   --output_path "$OUT" \
   "${OPT_ARGS[@]}" \
-  --enable_tensorboard_log
+  "${LOGGER_ARGS[@]}" \
+  "${LOG_ARGS[@]}" \
+  "${SAMPLE_ARGS[@]}"
 )
 
 printf '[train] command:'

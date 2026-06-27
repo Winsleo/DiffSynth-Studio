@@ -184,11 +184,17 @@ def first_frame_kwargs(spec, ref: Image.Image) -> dict:
 
 
 def generate_one(pipe, spec, row: dict, dataset: Path, control: str, height: int, width: int,
-                 num_frames: int, seed: int):
-    """Generate one dataset row and return the pipeline video frames."""
+                 num_frames: int, seed: int, num_inference_steps: int | None = None):
+    """Generate one dataset row and return the pipeline video frames.
+
+    ``num_inference_steps`` defaults to None (the pipeline's own default, unchanged);
+    pass a smaller value (e.g. from in-training periodic sampling) to trade quality for
+    speed.
+    """
     vace_video = load_frames(dataset, row["vace_video"][:num_frames])
     vace_video = _control_vace_video(vace_video, control, width, height)
     ref = Image.open(dataset / row["vace_reference_image"]).convert("RGB")
+    extra = {} if num_inference_steps is None else {"num_inference_steps": num_inference_steps}
     return pipe(
         prompt=row.get("prompt", "robot arm manipulation"),
         negative_prompt=NEG_PROMPT,
@@ -199,6 +205,7 @@ def generate_one(pipe, spec, row: dict, dataset: Path, control: str, height: int
         seed=seed,
         tiled=False,
         **first_frame_kwargs(spec, ref),
+        **extra,
     )
 
 

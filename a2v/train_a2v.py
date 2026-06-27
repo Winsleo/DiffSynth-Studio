@@ -36,6 +36,7 @@ from diffsynth.diffusion import *  # noqa: E402,F401,F403  (ModelLogger, launch_
 from a2v.base_spec import get_spec  # noqa: E402
 from a2v.data.operators import frame_list_video_operator  # noqa: E402
 from a2v.provision import ensure_vace, provision_a2v  # noqa: E402
+from a2v.train_logging import A2VModelLogger, PeriodicSampler, a2v_launch_training_task  # noqa: E402
 
 
 def _load_stock_train_module():
@@ -133,6 +134,22 @@ def main() -> None:
                              "Loads ONLY the DiT (T5/VAE/CLIP outputs come from the cache, so those "
                              "encoders are not loaded -> big VRAM + time saving) and reads cached .pth "
                              "tensors via load_from_cache (dataset_base_path = cache dir).")
+    # --- observability (a2v.train_logging): richer scalars + in-training sampling ---
+    parser.add_argument("--log_every", type=int, default=10,
+                        help="Log lr/grad_norm/throughput/gpu_mem every N steps (loss is logged every step).")
+    parser.add_argument("--log_grad_norm", type=int, default=1,
+                        help="1 = log grad norm on logging steps (computed before zero_grad); 0 = skip.")
+    parser.add_argument("--sample_every", type=int, default=0,
+                        help="Periodic in-training generation cadence in steps (0 = off). Reuses the live "
+                             "pipe; auto-skipped for cache-train / dual-expert / cpu-offload.")
+    parser.add_argument("--sample_rows", type=str, default="0",
+                        help="Comma-separated dataset row indices to sample (e.g. '0,1').")
+    parser.add_argument("--sample_controls", type=str, default="real",
+                        help="Comma-separated causal controls to sample: real|none|shuffle.")
+    parser.add_argument("--sample_num_frames", type=int, default=0,
+                        help="Frames per sample clip (0 -> use --num_frames).")
+    parser.add_argument("--sample_steps", type=int, default=0,
+                        help="Denoising steps per sample (0 -> pipeline default, 50). Lower = faster.")
     # The stock wan_parser defaults --remove_prefix_in_ckpt to "pipe.dit." (a non-None
     # value), which would shadow the spec default below (`is None` never True) and save
     # the VACE LoRA with a "pipe.vace." prefix that infer's load_lora cannot match.
@@ -246,7 +263,8 @@ def main() -> None:
         else:
             provision_a2v(model.pipe, spec)
 
-    model_logger = ModelLogger(  # noqa: F405
+    # A2VModelLogger == stock ModelLogger checkpoint behavior + richer scalar/video logging.
+    model_logger = A2VModelLogger(
         args.output_path,
         remove_prefix_in_ckpt=args.remove_prefix_in_ckpt,
         enable_tensorboard_log=args.enable_tensorboard_log,
@@ -255,19 +273,46 @@ def main() -> None:
         enable_wandb_log=args.enable_wandb_log,
         wandb_project=args.wandb_project,
     )
+    # Training tasks use the instrumented a2v loop; data_process stays stock (no step loop).
     launcher_map = {
         "sft:data_process": launch_data_process_task,  # noqa: F405
         "direct_distill:data_process": launch_data_process_task,  # noqa: F405
-        "sft": launch_training_task,  # noqa: F405
-        "sft:train": launch_training_task,  # noqa: F405
-        "direct_distill": launch_training_task,  # noqa: F405
-        "direct_distill:train": launch_training_task,  # noqa: F405
+        "sft": a2v_launch_training_task,
+        "sft:train": a2v_launch_training_task,
+        "direct_distill": a2v_launch_training_task,
+        "direct_distill:train": a2v_launch_training_task,
     }
     # Opt-in warmup+cosine LR (default constant = unchanged stock behavior). Training tasks only.
     if args.lr_schedule == "cosine" and not args.task.endswith(":data_process"):
         _install_cosine_lr_schedule(args, dataset)
 
-    launcher_map[args.task](accelerator, dataset, model, model_logger, args=args)
+    is_training = not args.task.endswith(":data_process")
+    if is_training:
+        # Periodic in-training sampling: only when requested, with a raw PNG dataset (cache-train
+        # prunes the encoders pipe(...) needs). PeriodicSampler self-gates dual-expert / cpu-offload.
+        sampler = None
+        if args.sample_every > 0 and not args.cache_train and spec is not None:
+            sampler = PeriodicSampler(
+                spec=spec,
+                dataset_path=args.dataset_base_path,
+                every=args.sample_every,
+                rows=[int(r) for r in args.sample_rows.split(",") if r.strip() != ""],
+                controls=[c for c in args.sample_controls.split(",") if c.strip() != ""],
+                height=args.height,
+                width=args.width,
+                num_frames=args.sample_num_frames if args.sample_num_frames > 0 else args.num_frames,
+                steps=args.sample_steps,
+                seed=getattr(args, "seed", 0) or 0,
+                model_logger=model_logger,
+                enable_model_cpu_offload=args.enable_model_cpu_offload,
+            )
+        elif args.sample_every > 0 and args.cache_train:
+            print("[a2v][sample] disabled: cache-train prunes the encoders pipe(...) needs.")
+        launcher_map[args.task](accelerator, dataset, model, model_logger, args=args,
+                                sampler=sampler, log_every=args.log_every,
+                                log_grad_norm=bool(args.log_grad_norm))
+    else:
+        launcher_map[args.task](accelerator, dataset, model, model_logger, args=args)
 
 
 if __name__ == "__main__":
