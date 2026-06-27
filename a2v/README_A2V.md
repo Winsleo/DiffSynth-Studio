@@ -1,15 +1,36 @@
 # A2V — Action-conditioned video on Wan (VACE)
 
 Turn a robot end-effector trajectory into a **3-channel RGB trajectory map**, feed it as
-`vace_video` through the official **VACE** path, freeze the DiT, and train only the VACE
-branch. A single declarative `WanBaseSpec` per base model hides the per-model differences, so
-the same **prepare → (cache) → train → evaluate** workflow runs on every supported Wan base.
+`vace_video` through the official **VACE** path, freeze the DiT, and train only the VACE branch.
+A single declarative `WanBaseSpec` per base model hides the per-model differences, so the **same
+workflow runs on every supported Wan base**:
 
-All A2V code lives under `a2v/`; the upstream `diffsynth/` is never modified.
+```
+Step 1 prepare data  →  Step 2 sanity-check  →  Step 3 train  →  Step 4 evaluate (causal gate)
+```
+
+All A2V code lives under `a2v/`; the upstream `diffsynth/` is **never modified**.
+
+> New here? Read **Setup** → **Choose a base model** → run **Quickstart** once to confirm your
+> environment, then follow **Step 1–4** to scale up to your own data. Dual-expert A14B and
+> bring-your-own-data are in **Advanced** / **Reference** at the bottom.
 
 ---
 
-## Supported base models
+## Setup
+
+```bash
+cd /vepfs/wangshilong/code/DiffSynth-Studio
+PY=.venv/bin/python            # the venv already has torch/h5py/tensorboard/etc.
+```
+
+- **GPU**: A100-80GB (8× available). Single GPU is enough for everything except large multi-epoch runs.
+- **Datasets** are written under `.cache/a2v_robotwin/`; **checkpoints** under `models/train/`.
+- Long runs should be detached (`tmux` / `nohup`) so a disconnect does not kill training.
+
+---
+
+## Choose a base model
 
 Pass one as `<base_spec>` (defined in `a2v/base_spec.py`):
 
@@ -22,17 +43,20 @@ Pass one as `<base_spec>` (defined in `a2v/base_spec.py`):
 | `wan2.2-i2v-a14b` | 2×14B MoE | from-DiT → full-param | `i2v_vae` (no CLIP) | 8-bit Adam |
 | `wan2.2-vace-fun-a14b` | 2×14B MoE | pretrained dual → full-param | `vace_reference` | 8-bit Adam |
 
-- **Dual-expert MoE** (`*-a14b`): a high-noise and a low-noise expert. Train them as two
-  separate jobs (`EXPERT=high`, then `EXPERT=low`); they are combined automatically at inference.
-- **Resolution rule**: H and W must be divisible by `vae_spatial_factor × 2` — 16 for Wan2.1
-  bases, **32 for Wan2.2** (TI2V / A14B with the Wan2.2 VAE).
-- The three derived numbers (never hardcoded): `vace_in_dim = 2·z_dim + spatial²`
-  (96 for Wan2.1, **352** for Wan2.2), `mask_pq = spatial` (8 / **16**), and explicit
-  `vace_layers` per depth.
+- **Start with `wan2.1-vace-1.3b`** — smallest, fastest sanity loop. `wan2.2-ti2v-5b` is the
+  current production world-model base.
+- **Resolution rule**: H and W must be divisible by `vae_spatial_factor × 2` — **16** for Wan2.1
+  bases, **32** for Wan2.2 (TI2V / A14B). `--num_frames` must be `4n+1`.
+- **Dual-expert MoE** (`*-a14b`): trained as two separate jobs and combined at inference — see
+  **Advanced** below. The internal derived numbers (`vace_in_dim` / `mask_pq` / `vace_layers`)
+  are in **Reference**; you never set them by hand.
 
 ---
 
-## Quickstart (single episode)
+## Quickstart — the whole pipeline in one block
+
+Copy/paste this to confirm your setup end-to-end on a single episode (smallest base). Each command
+is explained in **Step 1–4**.
 
 ```bash
 cd /vepfs/wangshilong/code/DiffSynth-Studio
@@ -46,10 +70,10 @@ $PY -m a2v.data.prepare --manifest .cache/a2v_robotwin/ep0_work/manifest.jsonl \
   --height 240 --width 320 --num_frames 121 \
   --resize_mode stretch --gripper_z_offset 0 --radius_mode physical
 
-# 2. Train (presets come from the spec; see "Training" below)
+# 2. Train (all presets come from the spec)
 CUDA_VISIBLE_DEVICES=0 bash a2v/train.sh wan2.1-vace-1.3b
 
-# 3. Causal gate: real control should reconstruct GT, the negative control should not
+# 3. Evaluate — causal gate: real control reconstructs GT, the negative control should not
 for c in real none; do $PY -m a2v.infer_a2v --base_spec wan2.1-vace-1.3b \
   --dataset .cache/a2v_robotwin/ep0_dataset_phys \
   --lora models/train/a2v_robotwin_ep0_lora_phys/step-1000.safetensors \
@@ -61,41 +85,266 @@ $PY -m a2v.causal_metrics --dataset .cache/a2v_robotwin/ep0_dataset_phys \
 
 ---
 
-## 1. Prepare data
+## Step 1 · Prepare data
 
-`robotwin_adapter` reads RoboTwin hdf5 → `actions/intrinsic/extrinsic.npy` + a manifest;
-`prepare` renders the trajectory maps and stores `video` and `vace_video` as same-indexed,
-lossless PNG lists (the core A2V alignment invariant: both routes see identical frames).
+Two stages: `robotwin_adapter` reads RoboTwin hdf5 → `actions/intrinsic/extrinsic.npy` + a
+`manifest.jsonl`; `prepare` renders the trajectory maps and stores `video` and `vace_video` as
+same-indexed, lossless PNG lists (the core A2V alignment invariant — both routes see identical
+frames). For non-RoboTwin data, produce the same manifest yourself (see **Reference**).
 
 ```bash
-$PY -m a2v.data.prepare --manifest <manifest.jsonl> --output_dir <dataset_dir> \
-  --height H --width W --num_frames N \         # N must be 4n+1; H,W divisible by 16 (Wan2.1) / 32 (Wan2.2)
+# adapter: RoboTwin episodes -> manifest.jsonl (see episode selection below)
+$PY -m a2v.data.robotwin_adapter --task <task> --robot_mode <robot_mode> \
+  [--episodes 0,3,7 | --episodes_range 0-49] --work_dir <work_dir>
+
+# prepare: manifest -> a ready A2V dataset (renders EVERY row in the manifest)
+$PY -m a2v.data.prepare --manifest <work_dir>/manifest.jsonl --output_dir <dataset_dir> \
+  --height H --width W --num_frames N \         # N = 4n+1; H,W divisible by 16 (Wan2.1) / 32 (Wan2.2)
   --resize_mode stretch --gripper_z_offset 0 --radius_mode physical \
   [--write_overlay] [--skip_short]              # overlay = debug; skip_short = drop too-short episodes
 ```
 
-Validate before training (no model weights needed):
+### One episode, a range, or a whole directory
+
+`robotwin_adapter` reads episodes from `<root>/<task>/<robot_mode>/data/episode*.hdf5`
+(default `--root /data/RoboTwin2.0_unpacked`; each needs a matching `video/episodeN.mp4`) and
+writes **one manifest row per episode**. `prepare` then renders every row, so the dataset size is
+decided entirely at the adapter step:
+
+| `robotwin_adapter` flag | episodes taken |
+| --- | --- |
+| `--episodes 0` | just episode 0 |
+| `--episodes 0,3,7` | those indices |
+| `--episodes_range 0-49` | inclusive range 0..49 |
+| *(omit both)* | **all `episode*.hdf5` in the dir** (missing hdf5/mp4 are skipped) |
 
 ```bash
-$PY -m a2v.data.validate --base_spec <spec> \
-  --dataset_base_path <dataset_dir> --dataset_metadata_path <dataset_dir>/metadata.jsonl \
-  --height H --width W --num_frames N
+# whole directory -> one multi-episode dataset (just drop --episodes)
+$PY -m a2v.data.robotwin_adapter --task beat_block_hammer \
+  --robot_mode aloha-agilex_clean_50 --work_dir .cache/a2v_robotwin/allep_work
+$PY -m a2v.data.prepare --manifest .cache/a2v_robotwin/allep_work/manifest.jsonl \
+  --output_dir .cache/a2v_robotwin/allep_dataset_phys \
+  --height 240 --width 320 --num_frames 105 \
+  --resize_mode stretch --gripper_z_offset 0 --radius_mode physical --skip_short
 ```
 
-For multi-task / multi-robot datasets use the batch builder, which fans out adapter+prepare
-per variant and merges them into one train + one held-out split:
+> Episodes often vary in length: pass `--skip_short` (without it `prepare` errors on any episode
+> shorter than `--num_frames`) and pick an `N` (`4n+1`) the episodes you want all meet.
+
+To split train / held-out within one task, run the adapter twice with complementary ranges
+(`--episodes_range 0-39` and `40-49`) into separate `--work_dir`/`--output_dir`.
+
+### Multi-task / multi-robot (with automatic train/held-out split)
+
+`build_dataset.sh` fans out adapter+prepare per (task, robot) variant in parallel, then merges
+them into one train + one held-out split:
 
 ```bash
 TASKS="beat_block_hammer adjust_bottle" ROBOTS="aloha-agilex franka ur5" \
+  SUFFIX=clean_50 TRAIN_RANGE=0-39 HELDOUT_RANGE=40-49 \
   H=480 W=640 FRAMES=49 bash a2v/data/build_dataset.sh
 # -> .cache/a2v_robotwin/wm_480_{train,heldout}
 ```
 
-### Input data contract (using your own robot data)
+- `SUFFIX` is appended to each robot (`<robot>_<SUFFIX>`, e.g. `aloha-agilex_clean_50`).
+- `TRAIN_RANGE` / `HELDOUT_RANGE` are inclusive episode ranges per split (defaults `0-449` /
+  `450-499` for `randomized_500`); set them to match how many episodes your dir holds.
 
-`robotwin_adapter` is RoboTwin-specific. For any other source, produce the same inputs
-`prepare` consumes — per episode, the **source video** + three `.npy` files, plus one
-manifest row:
+---
+
+## Step 2 · Sanity checks (recommended before a long run)
+
+Cheap gates that catch data/model problems before you commit GPU hours.
+
+```bash
+# data is well-formed for this base (no model weights needed)
+$PY -m a2v.data.validate --base_spec <spec> \
+  --dataset_base_path <dataset_dir> --dataset_metadata_path <dataset_dir>/metadata.jsonl \
+  --height H --width W --num_frames N
+
+# weights load + the VACE branch builds correctly for this base
+$PY -m a2v.check_load        --base_spec <spec>
+# + zero-side-effect provisioning gate (from-DiT bases); needs a dataset
+$PY -m a2v.check_provision   --base_spec <spec> --dataset <dataset_dir>
+
+# regression smokes (no dataset / no base needed)
+$PY -m a2v.check_parity                  # VACE-1.3B abstraction parity (loads VACE-1.3B)
+$PY -m a2v.render.check_projection       # intrinsic-scaling regression
+$PY -m a2v.data.smoke                    # synthetic end-to-end data smoke
+```
+
+---
+
+## Step 3 · Train — `a2v/train.sh`
+
+**`bash a2v/train.sh <base_spec>` is the single training entry** for every base and every scale.
+It wraps `python -m a2v.train_a2v` and fills presets (dataset / resolution / lr / optimizer /
+first-frame / LoRA-vs-full-param) from the spec. Override any preset with an env var.
+
+```bash
+# single-episode overfit (smallest sanity run)
+CUDA_VISIBLE_DEVICES=0 bash a2v/train.sh wan2.1-vace-1.3b
+
+# multi-episode, multi-GPU (raw dataset; encoders run each step)
+NPROC=8 DATASET=.cache/a2v_robotwin/ep_train40_phys \
+  FRAMES=105 REPEAT=4 EPOCHS=40 OUT=models/train/my_run \
+  bash a2v/train.sh wan2.1-i2v-14b-480p
+
+DRY_RUN=1 bash a2v/train.sh wan2.2-ti2v-5b   # print the resolved command, run nothing
+```
+
+Checkpoints land in `models/train/.../step-*.safetensors` (a LoRA for `vace-1.3b`, a full VACE
+state dict otherwise).
+
+### Env overrides
+
+| var | meaning |
+| --- | --- |
+| `DATASET` `OUT` `LR` `HEIGHT` `WIDTH` `FRAMES` `REPEAT` `EPOCHS` `SAVE_STEPS` | override per-base presets |
+| `NPROC` | data-parallel GPUs (DDP); default `1` |
+| `CACHE_TRAIN=1` `CACHE_DIR=` | train from a pre-encoded cache (see below) |
+| `RESUME=<ckpt>` | resume a long run |
+| `EXPERT=high\|low` | **required** for `*-a14b` (selects the MoE expert + its timestep band) |
+| `LR_SCHEDULE=constant\|cosine` | default `constant`; `cosine` = linear warmup → cosine decay (then `LR` is the **peak**) |
+| `WARMUP=<steps>` | cosine warmup steps; `0` → 3% of total (`num_epochs × len(dataset)`) |
+| `LR_MIN_RATIO=<frac>` | cosine final lr as a fraction of peak (default `0`) |
+| `LOGGER=tensorboard,…` | logging backends, comma list: `tensorboard` (default) `wandb` `swanlab` `none`. `WANDB_PROJECT`/`SWANLAB_PROJECT` name the project |
+| `LOG_EVERY=<n>` | log `lr`/`grad_norm`/`throughput_it_s`/`gpu_mem_gb` every `n` steps (default `10`; `loss` every step) |
+| `GRAD_NORM=0\|1` | log grad norm on logging steps, computed before `zero_grad` (default `1`) |
+| `SAMPLE_EVERY=<n>` | periodic in-training generation cadence (`0`=off); plus `SAMPLE_ROWS=` `SAMPLE_CONTROLS=` `SAMPLE_FRAMES=` `SAMPLE_STEPS=` |
+| `DRY_RUN=1` | print the command without launching |
+
+### Faster / lower-VRAM: cache-train (recommended for multi-epoch / large runs)
+
+Pre-encode the dataset once (VAE/T5/CLIP outputs cached), then train loading only the DiT(+VAE).
+Use a **fresh cache dir whenever resolution or data changes** (the cache is keyed by row index,
+not content).
+
+```bash
+D=.cache/a2v_robotwin/wm_480_train
+# encode once (shard across GPUs)
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 .venv/bin/accelerate launch --num_processes 8 \
+  --mixed_precision bf16 -m a2v.train_a2v --base_spec wan2.2-ti2v-5b --task sft:data_process \
+  --dataset_base_path "$D" --dataset_metadata_path "$D/metadata.jsonl" \
+  --data_file_keys video,vace_video --extra_inputs vace_video,input_image \
+  --height 480 --width 640 --num_frames 49 --dataset_repeat 1 \
+  --output_path .cache/a2v_robotwin/cache_wm_ti2v_480
+# train from the cache
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 SPEC=wan2.2-ti2v-5b CACHE_TRAIN=1 \
+  CACHE_DIR=.cache/a2v_robotwin/cache_wm_ti2v_480 NPROC=8 HEIGHT=480 WIDTH=640 FRAMES=49 \
+  LR=1e-5 REPEAT=1 EPOCHS=30 SAVE_STEPS=500 OUT=models/train/a2v_wm_ti2v_480 \
+  bash a2v/train.sh wan2.2-ti2v-5b
+```
+
+### LR schedule
+
+The default is constant lr. For longer / larger runs, `LR_SCHEDULE=cosine` warms up then
+cosine-decays — it lets you safely use a higher peak `LR` (warmup avoids early divergence) and
+settle into a lower final loss. Example:
+`LR_SCHEDULE=cosine WARMUP=300 LR=2e-5 LR_MIN_RATIO=0.05 ... bash a2v/train.sh <spec>`.
+
+### Logging & in-training samples (`a2v/train_logging.py`)
+
+Every run logs `loss` (DDP-averaged), `lr`, `grad_norm`, `throughput_it_s`, `gpu_mem_gb` to the
+selected backend(s). `SAMPLE_EVERY=N` reuses the *live* pipe to render short clips every `N`
+steps → mp4s under `<OUT>/samples/` plus a tensorboard image strip / wandb video. Sampling is
+auto-skipped (with a one-time warning) for `CACHE_TRAIN` (encoders are pruned), dual-expert
+`*-a14b` (needs both experts), and cpu-offload. Example:
+`LOGGER=tensorboard,wandb SAMPLE_EVERY=500 SAMPLE_CONTROLS=real,none SAMPLE_STEPS=20 ... bash a2v/train.sh wan2.2-ti2v-5b`.
+
+---
+
+## Step 4 · Evaluate (causal gate)
+
+The model is judged by **causal control**, not pixel loss alone: generate under the **real**
+trajectory and a **negative control** (`none` = blank map, `shuffle` = reversed), and require the
+real output to be clearly closer to GT.
+
+**Single episode** — `infer_a2v` then `causal_metrics`:
+
+```bash
+for c in real none shuffle; do $PY -m a2v.infer_a2v --base_spec <spec> \
+  --dataset <dataset_dir> --lora <ckpt.safetensors> \
+  --num_frames N --height H --width W --control $c --output .cache/a2v_robotwin/gen_$c.mp4; done
+$PY -m a2v.causal_metrics --dataset <dataset_dir> \
+  --real .cache/a2v_robotwin/gen_real.mp4 --none .cache/a2v_robotwin/gen_none.mp4
+# dual-expert: add --lora_low <low_ckpt> to infer_a2v
+```
+
+**Multi-episode generalization** — `eval_multiep` (loads the model once, writes a per-episode
+table + `metrics.json` + a `SUMMARY` with verdict):
+
+```bash
+$PY -m a2v.eval_multiep --base_spec <spec> --lora <ckpt> [--lora_low <low_ckpt>] \
+  --dataset .cache/a2v_robotwin/wm_480_heldout --rows 0,1,50,51 \
+  --num_frames N --height H --width W --controls real,none \
+  --output_dir .cache/a2v_robotwin/eval_heldout
+```
+
+**Pass criteria**: mean REAL MAE-GT well below NONE, `real<none` on (almost) every episode, REAL
+motion in the same order as GT. For strong-first-frame bases (i2v / ti2v) the negative control
+need not be static — it freely animates from frame 0 — so the signal is the clear `REAL ≪ NONE`
+gap, not "NONE is frozen".
+
+---
+
+## Advanced · Dual-expert A14B (`wan2.2-i2v-a14b`, `wan2.2-vace-fun-a14b`)
+
+A14B bases are a **two-expert MoE**: a high-noise expert and a low-noise expert. Train each as its
+own job (`EXPERT=` selects the expert and its timestep band), then pass **both** checkpoints at
+inference; DiffSynth switches experts by timestep automatically. Prepare/evaluate are otherwise
+the same as Step 1 / Step 4.
+
+```bash
+# 1. train the two experts (separate GPUs, or sequentially)
+EXPERT=high CUDA_VISIBLE_DEVICES=0 bash a2v/train.sh wan2.2-i2v-a14b   # -> ..._vace_a14b_high/
+EXPERT=low  CUDA_VISIBLE_DEVICES=1 bash a2v/train.sh wan2.2-i2v-a14b   # -> ..._vace_a14b_low/
+
+# 2. combined causal gate: high via --lora, low via --lora_low
+HI=models/train/a2v_robotwin_ep0_vace_a14b_high/step-1000.safetensors
+LO=models/train/a2v_robotwin_ep0_vace_a14b_low/step-1000.safetensors
+for c in real none shuffle; do $PY -m a2v.infer_a2v --base_spec wan2.2-i2v-a14b \
+  --dataset .cache/a2v_robotwin/ep0_dataset_phys --lora $HI --lora_low $LO \
+  --num_frames 121 --height 240 --width 320 --control $c \
+  --output .cache/a2v_robotwin/gen_a14b_$c.mp4; done
+$PY -m a2v.causal_metrics --dataset .cache/a2v_robotwin/ep0_dataset_phys \
+  --real .cache/a2v_robotwin/gen_a14b_real.mp4 --none .cache/a2v_robotwin/gen_a14b_none.mp4
+```
+
+- **Two A14B variants**: `wan2.2-i2v-a14b` builds VACE from-DiT with the `i2v_vae` first frame
+  (strongest pixel fidelity — best single-episode gate so far); `wan2.2-vace-fun-a14b` warm-starts
+  from PAI's pretrained dual VACE with `vace_reference`. Same `EXPERT=high|low` two-run pattern;
+  downloads differ (see `A2V_HISTORY.md` §18–§19).
+- **Inference loads both 14B experts** → CPU offload is enabled automatically (~45GB GPU); a single
+  GPU is enough. Always pass `--lora_low` for A14B (omitting it errors out).
+- **Multi-episode + cache**: pre-encode once (the cache is shared by both experts), cache-train
+  each expert with its `EXPERT=` band, then evaluate with `--lora_low`:
+
+  ```bash
+  # encode once -> shared cache; then per-expert cache-train
+  for E in high low; do
+    CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 SPEC=wan2.2-i2v-a14b CACHE_TRAIN=1 \
+      CACHE_DIR=.cache/a2v_robotwin/cache_train40_a14b NPROC=8 EXPERT=$E \
+      LR=1e-5 REPEAT=4 EPOCHS=40 SAVE_STEPS=100 \
+      OUT=models/train/a2v_robotwin_train40_vace_a14b_${E}_cached \
+      bash a2v/train.sh wan2.2-i2v-a14b
+  done
+  $PY -m a2v.eval_multiep --base_spec wan2.2-i2v-a14b \
+    --lora .../a14b_high_cached/step-800.safetensors \
+    --lora_low .../a14b_low_cached/step-800.safetensors \
+    --dataset .cache/a2v_robotwin/ep_heldout10_phys --num_frames 105 --height 240 --width 320 \
+    --controls real,none --output_dir .cache/a2v_robotwin/eval_heldout_a14b
+  ```
+
+---
+
+## Reference
+
+### Bring your own (non-RoboTwin) data
+
+`robotwin_adapter` is RoboTwin-specific. For any other source, produce the same inputs `prepare`
+consumes — per episode, the **source video** + three `.npy` files, plus one manifest row — then run
+`a2v.data.prepare` exactly as in Step 1.
 
 | input | shape / type | meaning |
 | --- | --- | --- |
@@ -120,182 +369,19 @@ Manifest (`metadata.jsonl`), one JSON object per line:
 ```
 
 Conventions that must hold (otherwise the projection misaligns):
-- `extrinsic` is **c2w**. RoboTwin stores world-to-camera (w2c) and `robotwin_adapter`
-  inverts it; if your poses are already c2w, do not invert again.
-- `original_size` must equal the real video resolution (intrinsics are scaled to the
-  training `--height/--width` from it).
+- `extrinsic` is **c2w**. RoboTwin stores world-to-camera (w2c) and `robotwin_adapter` inverts it;
+  if your poses are already c2w, do not invert again.
+- `original_size` must equal the real video resolution (intrinsics are scaled to the training
+  `--height/--width` from it).
 - End-effector poses are **TCP-framed** → `--gripper_z_offset 0`. Quaternions are **xyzw**.
   `video` and `actions` share one timeline (frame `t` ↔ action `t`).
 
-Then run `a2v.data.prepare` on your manifest exactly as above.
+### Base-model internals (derived automatically, never hardcode)
 
----
+`vace_in_dim = 2·z_dim + spatial²` (96 for Wan2.1, **352** for Wan2.2), `mask_pq = spatial`
+(8 / **16**), and explicit `vace_layers` per depth — all derived from the spec in `a2v/base_spec.py`.
 
-## 2. Train — `a2v/train.sh`
-
-**`bash a2v/train.sh <base_spec>` is the single training entry** for every base and every
-scale. It wraps `python -m a2v.train_a2v` and fills presets (dataset / resolution / lr /
-optimizer / first-frame / LoRA-vs-full-param) from the spec. Override any preset with an env var.
-
-```bash
-# single-episode overfit (smallest sanity run)
-CUDA_VISIBLE_DEVICES=0 bash a2v/train.sh wan2.2-ti2v-5b
-
-# multi-episode, multi-GPU (raw dataset; encoders run each step)
-NPROC=8 DATASET=.cache/a2v_robotwin/ep_train40_phys \
-  FRAMES=105 REPEAT=4 EPOCHS=40 OUT=models/train/my_run \
-  bash a2v/train.sh wan2.1-i2v-14b-480p
-
-# dual-expert A14B: run twice (high then low), combined at inference
-EXPERT=high CUDA_VISIBLE_DEVICES=0 bash a2v/train.sh wan2.2-i2v-a14b
-EXPERT=low  CUDA_VISIBLE_DEVICES=1 bash a2v/train.sh wan2.2-i2v-a14b
-
-DRY_RUN=1 bash a2v/train.sh wan2.2-ti2v-5b   # print the resolved command, run nothing
-```
-
-### Env overrides
-
-| var | meaning |
-| --- | --- |
-| `DATASET` `OUT` `LR` `HEIGHT` `WIDTH` `FRAMES` `REPEAT` `EPOCHS` `SAVE_STEPS` | override per-base presets |
-| `NPROC` | data-parallel GPUs (DDP); default `1` |
-| `CACHE_TRAIN=1` `CACHE_DIR=` | train from a pre-encoded cache (see below) |
-| `RESUME=<ckpt>` | resume a long run |
-| `EXPERT=high\|low` | **required** for `*-a14b` (selects the MoE expert + its timestep band) |
-| `LR_SCHEDULE=constant\|cosine` | default `constant`; `cosine` = linear warmup → cosine decay (then `LR` is the **peak**) |
-| `WARMUP=<steps>` | cosine warmup steps; `0` → 3% of total (`num_epochs × len(dataset)`) |
-| `LR_MIN_RATIO=<frac>` | cosine final lr as a fraction of peak (default `0`) |
-| `DRY_RUN=1` | print the command without launching |
-
-> **LR schedule**: the default is constant lr (unchanged). For longer / larger runs, `LR_SCHEDULE=cosine`
-> warms up then cosine-decays — it lets you safely use a higher peak `LR` (warmup avoids early
-> divergence) and settle into a lower final loss (decay reduces end-of-training noise). Example:
-> `LR_SCHEDULE=cosine WARMUP=300 LR=2e-5 LR_MIN_RATIO=0.05 ... bash a2v/train.sh <spec>`.
-
-Checkpoints: `models/train/.../step-*.safetensors` (LoRA for `vace-1.3b`, full VACE state
-dict otherwise).
-
-### Cache-train (recommended for multi-epoch / large runs)
-
-Pre-encode the dataset once (VAE/T5/CLIP outputs cached), then train loading only the DiT(+VAE)
-— faster and lower VRAM. Use a **fresh cache dir whenever resolution or data changes** (cache is
-keyed by row index, not content).
-
-```bash
-D=.cache/a2v_robotwin/wm_480_train
-# encode once (shard across GPUs)
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 .venv/bin/accelerate launch --num_processes 8 \
-  --mixed_precision bf16 -m a2v.train_a2v --base_spec wan2.2-ti2v-5b --task sft:data_process \
-  --dataset_base_path "$D" --dataset_metadata_path "$D/metadata.jsonl" \
-  --data_file_keys video,vace_video --extra_inputs vace_video,input_image \
-  --height 480 --width 640 --num_frames 49 --dataset_repeat 1 \
-  --output_path .cache/a2v_robotwin/cache_wm_ti2v_480
-# train from the cache
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 SPEC=wan2.2-ti2v-5b CACHE_TRAIN=1 \
-  CACHE_DIR=.cache/a2v_robotwin/cache_wm_ti2v_480 NPROC=8 HEIGHT=480 WIDTH=640 FRAMES=49 \
-  LR=1e-5 REPEAT=1 EPOCHS=30 SAVE_STEPS=500 OUT=models/train/a2v_wm_ti2v_480 \
-  bash a2v/train.sh wan2.2-ti2v-5b
-```
-
-> Long runs should be detached (`tmux` / `nohup`) so a disconnect does not kill training;
-> resume with `RESUME=<ckpt>`.
-
-### Dual-expert A14B (`wan2.2-i2v-a14b`, `wan2.2-vace-fun-a14b`)
-
-A14B bases are a **two-expert MoE**: a high-noise expert and a low-noise expert. Train each as
-its own job — `EXPERT=` selects the expert and its timestep band — then pass **both**
-checkpoints at inference; DiffSynth switches experts by timestep automatically.
-
-```bash
-# 1. train the two experts (separate GPUs, or sequentially)
-EXPERT=high CUDA_VISIBLE_DEVICES=0 bash a2v/train.sh wan2.2-i2v-a14b   # -> ..._vace_a14b_high/
-EXPERT=low  CUDA_VISIBLE_DEVICES=1 bash a2v/train.sh wan2.2-i2v-a14b   # -> ..._vace_a14b_low/
-
-# 2. combined causal gate: high via --lora, low via --lora_low
-HI=models/train/a2v_robotwin_ep0_vace_a14b_high/step-1000.safetensors
-LO=models/train/a2v_robotwin_ep0_vace_a14b_low/step-1000.safetensors
-for c in real none shuffle; do $PY -m a2v.infer_a2v --base_spec wan2.2-i2v-a14b \
-  --dataset .cache/a2v_robotwin/ep0_dataset_phys --lora $HI --lora_low $LO \
-  --num_frames 121 --height 240 --width 320 --control $c \
-  --output .cache/a2v_robotwin/gen_a14b_$c.mp4; done
-$PY -m a2v.causal_metrics --dataset .cache/a2v_robotwin/ep0_dataset_phys \
-  --real .cache/a2v_robotwin/gen_a14b_real.mp4 --none .cache/a2v_robotwin/gen_a14b_none.mp4
-```
-
-- **Two A14B variants**: `wan2.2-i2v-a14b` builds VACE from-DiT with the `i2v_vae` first frame
-  (strongest pixel fidelity — best single-episode gate so far); `wan2.2-vace-fun-a14b`
-  warm-starts from PAI's pretrained dual VACE with `vace_reference`. Same `EXPERT=high|low`
-  two-run pattern; downloads differ (see `A2V_HISTORY.md` §18–§19).
-- **Inference loads both 14B experts** → CPU offload is enabled automatically (~45GB GPU);
-  a single GPU is enough. Always pass `--lora_low` for A14B (omitting it errors out).
-- **Multi-episode + cache**: pre-encode once (the cache is shared by both experts), then
-  cache-train each expert with its `EXPERT=` band, and evaluate with `--lora_low`:
-
-  ```bash
-  # encode once -> shared cache; then per-expert cache-train
-  for E in high low; do
-    CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 SPEC=wan2.2-i2v-a14b CACHE_TRAIN=1 \
-      CACHE_DIR=.cache/a2v_robotwin/cache_train40_a14b NPROC=8 EXPERT=$E \
-      LR=1e-5 REPEAT=4 EPOCHS=40 SAVE_STEPS=100 \
-      OUT=models/train/a2v_robotwin_train40_vace_a14b_${E}_cached \
-      bash a2v/train.sh wan2.2-i2v-a14b
-  done
-  $PY -m a2v.eval_multiep --base_spec wan2.2-i2v-a14b \
-    --lora .../a14b_high_cached/step-800.safetensors \
-    --lora_low .../a14b_low_cached/step-800.safetensors \
-    --dataset .cache/a2v_robotwin/ep_heldout10_phys --num_frames 105 --height 240 --width 320 \
-    --controls real,none --output_dir .cache/a2v_robotwin/eval_heldout_a14b
-  ```
-
----
-
-## 3. Evaluate (causal gate)
-
-The model is judged by causal control, not pixel loss alone: generate under the **real**
-trajectory and a **negative control** (`none` = blank map, `shuffle` = reversed), and require
-the real output to be clearly closer to GT.
-
-**Single episode** — `causal_metrics`:
-
-```bash
-for c in real none shuffle; do $PY -m a2v.infer_a2v --base_spec <spec> \
-  --dataset <dataset_dir> --lora <ckpt.safetensors> \
-  --num_frames N --height H --width W --control $c --output .cache/a2v_robotwin/gen_$c.mp4; done
-$PY -m a2v.causal_metrics --dataset <dataset_dir> \
-  --real .cache/a2v_robotwin/gen_real.mp4 --none .cache/a2v_robotwin/gen_none.mp4
-# dual-expert: add --lora_low <low_ckpt> to infer_a2v
-```
-
-**Multi-episode generalization** — `eval_multiep` (loads the model once, writes per-episode
-table + `metrics.json` + a `SUMMARY` with verdict):
-
-```bash
-$PY -m a2v.eval_multiep --base_spec <spec> --lora <ckpt> [--lora_low <low_ckpt>] \
-  --dataset .cache/a2v_robotwin/wm_480_heldout --rows 0,1,50,51 \
-  --num_frames N --height H --width W --controls real,none \
-  --output_dir .cache/a2v_robotwin/eval_heldout
-```
-
-**Pass criteria**: mean REAL MAE-GT well below NONE, `real<none` on (almost) every episode,
-REAL motion in the same order as GT. For strong-first-frame bases (i2v / ti2v) the negative
-control need not be static — it freely animates from frame 0 — so the signal is the clear
-`REAL ≪ NONE` gap, not "NONE is frozen".
-
----
-
-## 4. Pre-flight checks
-
-```bash
-$PY -m a2v.check_load        --base_spec <spec>                 # weights load + VACE branch builds
-$PY -m a2v.check_provision   --base_spec <spec> --dataset <ds>  # + zero-side-effect gate (from-DiT bases)
-$PY -m a2v.check_parity                                         # VACE-1.3B abstraction parity
-$PY -m a2v.render.check_projection                              # intrinsic-scaling regression
-$PY -m a2v.data.smoke                                           # synthetic end-to-end data smoke
-```
-
----
-
-## Layout
+### Repo layout
 
 ```
 a2v/
@@ -303,6 +389,7 @@ a2v/
   provision.py        VACE supply: create_vace_from_dit / ensure_vace / provision_a2v
   vace_unit.py        mask_pq-parameterized VACE unit (no diffsynth edit)
   train_a2v.py        trainer module wrapped by train.sh (frame-list operator, from-DiT vace, cache-train)
+  train_logging.py    A2VModelLogger + instrumented training loop (lr/grad-norm/throughput/mem) + PeriodicSampler
   train.sh            >> training entry: bash a2v/train.sh <base_spec> [env overrides]
   infer_a2v.py        inference + causal-control harness (real / none / shuffle)
   eval_multiep.py     multi-episode generalization evaluator (model loaded once)
