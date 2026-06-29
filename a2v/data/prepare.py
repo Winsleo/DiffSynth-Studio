@@ -180,6 +180,31 @@ def resolve_prompt(item: dict[str, Any], default_prompt: str) -> str:
     return str(prompt)
 
 
+def _largest_4np1_leq(x: int) -> Optional[int]:
+    """Largest value of the form 4n+1 that is <= x (None if x < 1)."""
+    if x < 1:
+        return None
+    return ((x - 1) // 4) * 4 + 1
+
+
+def effective_num_frames(total_frames: int, args: argparse.Namespace) -> Optional[int]:
+    """Frame count to render for one episode.
+
+    Fixed mode (``--max_num_frames`` unset): always ``args.num_frames``; length
+    feasibility is left to ``select_frame_indices`` so ``--skip_short`` behaviour
+    is unchanged. Cap mode: the largest 4n+1 <= ``min(feasible-at-stride, cap)``,
+    i.e. each episode keeps as long a centred window as it can support, capped at
+    ``--max_num_frames``. Returns ``None`` when even a 5-frame clip is impossible.
+    """
+    if args.max_num_frames is None:
+        return args.num_frames
+    feasible = (total_frames - 1) // args.stride + 1  # max frame count at this stride
+    by_len = _largest_4np1_leq(feasible)
+    if by_len is None:
+        return None
+    return min(by_len, args.max_num_frames)
+
+
 def build_sample(
     item: dict[str, Any],
     index: int,
@@ -203,20 +228,32 @@ def build_sample(
     total_frames = int(item.get("total_frames") or get_reader_num_frames(video_path))
     if item.get("frame_indices") is not None:
         frame_indices = [int(i) for i in item["frame_indices"]]
-        if len(frame_indices) != args.num_frames:
-            raise ValueError(f"{sample_name}: frame_indices has {len(frame_indices)} frames, expected {args.num_frames}")
-        if args.num_frames % 4 != 1:
-            raise ValueError(f"num_frames must be 4n+1, got {args.num_frames}")
+        nf = len(frame_indices)
+        if nf % 4 != 1:
+            raise ValueError(f"{sample_name}: frame_indices has {nf} frames, must be 4n+1")
+        if args.max_num_frames is None and nf != args.num_frames:
+            raise ValueError(f"{sample_name}: frame_indices has {nf} frames, expected {args.num_frames}")
     else:
+        # Per-episode frame count: fixed --num_frames, or (cap mode) the longest
+        # 4n+1 window this episode supports, capped at --max_num_frames.
+        nf = effective_num_frames(total_frames, args)
+        if nf is None or nf < args.min_num_frames:
+            # Too short to render even a min-length clip. In cap mode this is the
+            # natural "skip too-short" branch; otherwise honour --skip_short.
+            if args.skip_short or args.max_num_frames is not None:
+                print(f"[skip] {sample_name}: only {total_frames} source frames < "
+                      f"min_num_frames={args.min_num_frames} (stride={args.stride})")
+                return None
+            raise ValueError(f"{sample_name}: only {total_frames} source frames")
         start = item.get("start_frame", args.start_frame)
         try:
-            frame_indices = select_frame_indices(total_frames, args.num_frames, start=start, stride=args.stride)
+            frame_indices = select_frame_indices(total_frames, nf, start=start, stride=args.stride)
         except ValueError:
-            # Episode shorter than num_frames*stride. For batch dataset building across
+            # Episode shorter than nf*stride. For batch dataset building across
             # robots with varied episode lengths, skip it instead of aborting the whole run.
-            if args.skip_short:
+            if args.skip_short or args.max_num_frames is not None:
                 print(f"[skip] {sample_name}: only {total_frames} source frames < "
-                      f"needed for num_frames={args.num_frames} stride={args.stride}")
+                      f"needed for num_frames={nf} stride={args.stride}")
                 return None
             raise
 
@@ -235,8 +272,8 @@ def build_sample(
         c2w = c2w_seq
     else:
         raise ValueError(f"{sample_name}: expected c2w shape [T,4,4] or [V,T,4,4], got {tuple(c2w_seq.shape)}")
-    if c2w.shape[1] != args.num_frames:
-        raise ValueError(f"{sample_name}: c2w has {c2w.shape[1]} frames, expected {args.num_frames}")
+    if c2w.shape[1] != nf:
+        raise ValueError(f"{sample_name}: c2w has {c2w.shape[1]} frames, expected {nf}")
     if not torch.allclose(c2w[..., 3, :], torch.tensor([0, 0, 0, 1], dtype=c2w.dtype, device=c2w.device), atol=1e-4):
         raise ValueError(f"{sample_name}: extrinsics must be valid 4x4 c2w transforms with last row [0,0,0,1]")
     # Extrinsics are interpreted as camera-to-world (c2w), matching ABot. If a
@@ -295,7 +332,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output_dir", required=True, help="Output dataset directory.")
     parser.add_argument("--height", type=int, required=True)
     parser.add_argument("--width", type=int, required=True)
-    parser.add_argument("--num_frames", type=int, default=49, help="Must satisfy 4n+1.")
+    parser.add_argument("--num_frames", type=int, default=49, help="Must satisfy 4n+1. Ignored when --max_num_frames is set.")
+    parser.add_argument("--max_num_frames", type=int, default=None,
+                        help="Cap mode: render each episode at the largest 4n+1 <= min(its length, this cap), "
+                             "producing a variable-length dataset (training uses each PNG list as-is). Must be 4n+1.")
+    parser.add_argument("--min_num_frames", type=int, default=49,
+                        help="Cap mode: drop episodes whose largest feasible 4n+1 window is below this. Must be 4n+1.")
     parser.add_argument("--stride", type=int, default=1)
     parser.add_argument("--start_frame", type=int, default=None)
     parser.add_argument("--resize_mode", choices=("crop", "stretch"), default="crop", help="Use crop to match DiffSynth ImageCropAndResize.")
@@ -325,6 +367,13 @@ def main() -> None:
     args = parse_args()
     if args.num_frames % 4 != 1:
         raise SystemExit(f"--num_frames must satisfy 4n+1, got {args.num_frames}")
+    if args.max_num_frames is not None:
+        if args.max_num_frames % 4 != 1:
+            raise SystemExit(f"--max_num_frames must satisfy 4n+1, got {args.max_num_frames}")
+        if args.min_num_frames % 4 != 1:
+            raise SystemExit(f"--min_num_frames must satisfy 4n+1, got {args.min_num_frames}")
+        if args.min_num_frames > args.max_num_frames:
+            raise SystemExit("--min_num_frames must be <= --max_num_frames")
     if args.stride <= 0:
         raise SystemExit("--stride must be positive")
     if args.height % 16 != 0 or args.width % 16 != 0:

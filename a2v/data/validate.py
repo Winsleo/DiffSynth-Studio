@@ -19,6 +19,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--height", type=int, required=True)
     parser.add_argument("--width", type=int, required=True)
     parser.add_argument("--num_frames", type=int, required=True)
+    parser.add_argument("--max_num_frames", type=int, default=None,
+                        help="Variable-length dataset: instead of requiring exactly --num_frames per row, "
+                             "accept any 4n+1 length <= this cap (and video/vace_video must match each other).")
     parser.add_argument("--base_spec", default=None, help="Optional WanBaseSpec name; derives spatial/time divisibility factors.")
     parser.add_argument("--max_items", type=int, default=10)
     return parser.parse_args()
@@ -61,13 +64,25 @@ def main() -> None:
             value = data[key]
             if not isinstance(value, list):
                 raise AssertionError(f"row {idx}: {key} is {type(value)}, expected list")
-            if len(value) != args.num_frames:
-                raise AssertionError(f"row {idx}: {key} has {len(value)} frames, expected {args.num_frames}")
+            if args.max_num_frames is None:
+                if len(value) != args.num_frames:
+                    raise AssertionError(f"row {idx}: {key} has {len(value)} frames, expected {args.num_frames}")
+            else:
+                if len(value) % time_division_factor != 1:
+                    raise AssertionError(
+                        f"row {idx}: {key} has {len(value)} frames, must be {time_division_factor}n+1")
+                if len(value) > args.max_num_frames:
+                    raise AssertionError(
+                        f"row {idx}: {key} has {len(value)} frames, exceeds cap {args.max_num_frames}")
             for frame_idx, frame in enumerate(value):
                 if image_size(frame) != (args.height, args.width):
                     raise AssertionError(
                         f"row {idx}: {key}[{frame_idx}] size {image_size(frame)}, expected {(args.height, args.width)}"
                     )
+        if len(data["video"]) != len(data["vace_video"]):
+            raise AssertionError(
+                f"row {idx}: video has {len(data['video'])} frames but vace_video has "
+                f"{len(data['vace_video'])} - the two streams must stay frame-locked")
         ref = data["vace_reference_image"]
         if not isinstance(ref, list) or len(ref) != 1:
             raise AssertionError(f"row {idx}: vace_reference_image should load as one-frame list")
