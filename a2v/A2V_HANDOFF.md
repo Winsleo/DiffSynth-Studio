@@ -49,11 +49,16 @@
 > - **Run-2（进行中,job 1394）**：cosine + **adamw_offload** + wandb，5 epochs，复用上面 cache，输出 `models/train/a2v_clean50_ti2v_480_c121_cosine/`。sbatch：`.cache/a2v_robotwin/train_logs/train_cosine.sbatch`（含 `--exclude=…118 --exclusive` + `WANDB_API_KEY`）。排障链：①②两次落到蹭卡的 118 → OOM；③排除 118 后在干净节点 116 跑通整步、但 wandb 无 key 崩（已修，见上）；④注入 key 重交=**1394**，干净节点运行中。`adamw_offload` 显存已验证够。
 > - sbatch 模板都在 `.cache/a2v_robotwin/train_logs/`（`encode.sbatch`/`train.sbatch`/`train_cosine.sbatch`）；务必 `export PYTHONUNBUFFERED=1` 否则日志不刷。
 >
+> **Run-2 实时状态（2026-06-29 ~16:00）**：1394 RUNNING@node116，**~10 s/步**（adamw_offload 约为 8-bit 的 2×），已出 `step-500`，5 epoch≈7085 步 → 预计 **~20h** 跑完（48h 时限内，每 500 步存 ckpt）。wandb run：**https://wandb.ai/winsleo-sjtu/a2v-ti2v-5b/runs/9weppi64**（`helpful-jazz-1`）。
+>
+> **代码已提交**（分支 `a2v`，author `winsleo <winsleo@foxmail.com>`，**未 push**）：6 个提交 `344203a..20c6e9d`——变长 prepare/validate、build_robotwin_all.sh、base_spec 路径统一(A2V_MODELS_DIR)、train.sh 默认值(cosine/adamw/wandb)+PY、README/HANDOFF/ENVIRONMENT 文档。`.cache/` 与 `models/` 为 gitignore（数据/cache/ckpt 不入库）。
+>
 > **新会话续接怎么做**
-> 1. `squeue -u sjtuadmin` 看 1389（或新作业）状态；日志 `.cache/a2v_robotwin/train_logs/train_cosine-<jobid>.out`；ckpt 目录 `models/train/a2v_clean50_ti2v_480_c121_cosine/`。
-> 2. 若需重交训练：`sbatch .cache/a2v_robotwin/train_logs/train_cosine.sbatch`（已排除 118）。复用 cache，免重编码。
-> 3. 训练完做 **Step 4 因果门控**（README）：`infer_a2v` real/none/shuffle + `causal_metrics`，或 `eval_multiep`。注意**当初未切 held-out**（全作训练），严格泛化需另抽 episode 建小评估集。
-> 4. wandb：project `a2v-ti2v-5b`，entity `winsleo-sjtu`(wangshilong)，看 cosine vs constant 的 loss 对比。
+> 0. 先 `export A2V_MODELS_DIR=/disk/worldmodel/public_model`（跑任何 ti2v-5b 命令前；sbatch 已自带）。
+> 1. `squeue -u sjtuadmin` 看 **1394**（或新作业）状态；日志 `.cache/a2v_robotwin/train_logs/train_cosine-<jobid>.out`；ckpt 目录 `models/train/a2v_clean50_ti2v_480_c121_cosine/`；曲线见上面 wandb run。
+> 2. 若需重交训练：`sbatch .cache/a2v_robotwin/train_logs/train_cosine.sbatch`（已含 `--exclude=…118 --exclusive` + `A2V_MODELS_DIR` + `WANDB_API_KEY`）。复用 cache，免重编码。
+> 3. 训练完做 **Step 4 因果门控**（README）：`infer_a2v` real/none/shuffle + `causal_metrics`，或 `eval_multiep`。注意**当初未切 held-out**（全作训练），严格泛化需另抽 episode 建小评估集。对照 Run-1（constant+8bit，`…_c121/step-7085`）看 cosine 是否消除了 loss 震荡。
+> 4. wandb：project `a2v-ti2v-5b`，entity `winsleo-sjtu`(wangshilong，由 sbatch 里的 WANDB_API_KEY 决定，**非 netrc 的 gongziyang**)。
 > - 详细：项目记忆 `a2v-cluster-setup` / `a2v-variable-length-prep`；README 已更新（变长 + build_robotwin_all + cache-train + 新默认）。
 >
 > ---
