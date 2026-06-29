@@ -13,6 +13,7 @@ Derived, never hardcoded (the three numbers that bite — master plan §1):
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from glob import glob
 from pathlib import Path
@@ -135,15 +136,27 @@ class WanBaseSpec:
         return _abs(self.tokenizer_path)
 
 
-_CONVERTED = "models/DiffSynth-Studio/Wan-Series-Converted-Safetensors"
+# All base-model weights resolve under ONE root: $A2V_MODELS_DIR (default: the in-repo
+# `models/`). Every path field below is built with _m(<rel>), so there is no hardcoded
+# absolute/cluster path. Point A2V_MODELS_DIR at wherever the model repos live; the required
+# sub-layout (HF/ModelScope dir names) is documented in A2V_HANDOFF.md (model path layout).
+_MODELS = os.environ.get("A2V_MODELS_DIR") or str(REPO_ROOT / "models")
+
+
+def _m(rel: str) -> str:
+    """Absolute path to a model file/dir under the models root ($A2V_MODELS_DIR)."""
+    return str(Path(_MODELS) / rel)
+
+
+_CONVERTED = "DiffSynth-Studio/Wan-Series-Converted-Safetensors"  # converted VAE/T5 dir, under _MODELS
 
 REGISTRY: dict[str, WanBaseSpec] = {
     "wan2.1-vace-1.3b": WanBaseSpec(
         name="wan2.1-vace-1.3b",
-        dit_path="models/Wan-AI/Wan2.1-VACE-1.3B/diffusion_pytorch_model.safetensors",
-        vae_path=f"{_CONVERTED}/Wan2.1_VAE.safetensors",
-        t5_path=f"{_CONVERTED}/models_t5_umt5-xxl-enc-bf16.safetensors",
-        tokenizer_path="models/Wan-AI/Wan2.1-T2V-1.3B/google/umt5-xxl",
+        dit_path=_m("Wan-AI/Wan2.1-VACE-1.3B/diffusion_pytorch_model.safetensors"),
+        vae_path=_m(f"{_CONVERTED}/Wan2.1_VAE.safetensors"),
+        t5_path=_m(f"{_CONVERTED}/models_t5_umt5-xxl-enc-bf16.safetensors"),
+        tokenizer_path=_m("Wan-AI/Wan2.1-T2V-1.3B/google/umt5-xxl"),
         dim=1536, num_layers=30, num_heads=12, ffn_dim=8960,
         vae_z_dim=16, vae_spatial_factor=8,
         has_pretrained_vace=True,
@@ -156,10 +169,10 @@ REGISTRY: dict[str, WanBaseSpec] = {
     # (+ first_frame_mode="none"). dit_path is the official T2V DiT (no vace_* keys).
     "wan2.1-t2v-1.3b": WanBaseSpec(
         name="wan2.1-t2v-1.3b",
-        dit_path="models/Wan-AI/Wan2.1-T2V-1.3B/diffusion_pytorch_model.safetensors",
-        vae_path=f"{_CONVERTED}/Wan2.1_VAE.safetensors",
-        t5_path=f"{_CONVERTED}/models_t5_umt5-xxl-enc-bf16.safetensors",
-        tokenizer_path="models/Wan-AI/Wan2.1-T2V-1.3B/google/umt5-xxl",
+        dit_path=_m("Wan-AI/Wan2.1-T2V-1.3B/diffusion_pytorch_model.safetensors"),
+        vae_path=_m(f"{_CONVERTED}/Wan2.1_VAE.safetensors"),
+        t5_path=_m(f"{_CONVERTED}/models_t5_umt5-xxl-enc-bf16.safetensors"),
+        tokenizer_path=_m("Wan-AI/Wan2.1-T2V-1.3B/google/umt5-xxl"),
         dim=1536, num_layers=30, num_heads=12, ffn_dim=8960,
         vae_z_dim=16, vae_spatial_factor=8,
         has_pretrained_vace=False,                # SEAM-1: create_vace_from_dit
@@ -177,11 +190,11 @@ REGISTRY: dict[str, WanBaseSpec] = {
     "wan2.1-i2v-14b-480p": WanBaseSpec(
         name="wan2.1-i2v-14b-480p",
         dit_path="",                              # unused; sharded -> dit_glob
-        dit_glob="models/Wan-AI/Wan2.1-I2V-14B-480P/diffusion_pytorch_model-*.safetensors",
-        vae_path=f"{_CONVERTED}/Wan2.1_VAE.safetensors",          # Wan2.1 VAE (z=16, s=8)
-        t5_path=f"{_CONVERTED}/models_t5_umt5-xxl-enc-bf16.safetensors",
-        tokenizer_path="models/Wan-AI/Wan2.1-T2V-1.3B/google/umt5-xxl",
-        image_encoder_path="models/Wan-AI/Wan2.1-I2V-14B-480P/models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth",
+        dit_glob=_m("Wan-AI/Wan2.1-I2V-14B-480P/diffusion_pytorch_model-*.safetensors"),
+        vae_path=_m(f"{_CONVERTED}/Wan2.1_VAE.safetensors"),          # Wan2.1 VAE (z=16, s=8)
+        t5_path=_m(f"{_CONVERTED}/models_t5_umt5-xxl-enc-bf16.safetensors"),
+        tokenizer_path=_m("Wan-AI/Wan2.1-T2V-1.3B/google/umt5-xxl"),
+        image_encoder_path=_m("Wan-AI/Wan2.1-I2V-14B-480P/models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth"),
         dim=5120, num_layers=40, num_heads=40, ffn_dim=13824,
         vae_z_dim=16, vae_spatial_factor=8,       # vace_in_dim=96, mask_pq=8 (Wan2.1 VAE)
         has_pretrained_vace=False,                # SEAM-1: create_vace_from_dit (warm-start optional)
@@ -198,10 +211,10 @@ REGISTRY: dict[str, WanBaseSpec] = {
     "wan2.2-ti2v-5b": WanBaseSpec(
         name="wan2.2-ti2v-5b",
         dit_path="",                              # robust to one-file vs sharded layout
-        dit_glob="models/Wan-AI/Wan2.2-TI2V-5B/diffusion_pytorch_model*.safetensors",
-        vae_path=f"{_CONVERTED}/Wan2.2_VAE.safetensors",          # Wan2.2 VAE (z=48, s=16)
-        t5_path=f"{_CONVERTED}/models_t5_umt5-xxl-enc-bf16.safetensors",
-        tokenizer_path="models/Wan-AI/Wan2.1-T2V-1.3B/google/umt5-xxl",
+        dit_glob=_m("Wan-AI/Wan2.2-TI2V-5B/diffusion_pytorch_model*.safetensors"),
+        vae_path=_m("Wan-AI/Wan2.2-TI2V-5B/Wan2.2_VAE.pth"),    # Wan2.2 VAE (z=48, s=16); .pth ok
+        t5_path=_m("Wan-AI/Wan2.2-TI2V-5B/models_t5_umt5-xxl-enc-bf16.pth"),
+        tokenizer_path=_m("Wan-AI/Wan2.2-TI2V-5B/google/umt5-xxl"),
         dim=3072, num_layers=30, num_heads=24, ffn_dim=14336,
         vae_z_dim=48, vae_spatial_factor=16,      # vace_in_dim=352, mask_pq=16
         has_pretrained_vace=False,                # SEAM-1: create_vace_from_dit
@@ -221,9 +234,9 @@ REGISTRY: dict[str, WanBaseSpec] = {
     "wan2.2-i2v-a14b": WanBaseSpec(
         name="wan2.2-i2v-a14b",
         dit_path="",                              # unused; experts -> expert_dit_globs
-        vae_path=f"{_CONVERTED}/Wan2.1_VAE.safetensors",         # Wan2.1 VAE (z=16, s=8)
-        t5_path=f"{_CONVERTED}/models_t5_umt5-xxl-enc-bf16.safetensors",
-        tokenizer_path="models/Wan-AI/Wan2.1-T2V-1.3B/google/umt5-xxl",
+        vae_path=_m(f"{_CONVERTED}/Wan2.1_VAE.safetensors"),         # Wan2.1 VAE (z=16, s=8)
+        t5_path=_m(f"{_CONVERTED}/models_t5_umt5-xxl-enc-bf16.safetensors"),
+        tokenizer_path=_m("Wan-AI/Wan2.1-T2V-1.3B/google/umt5-xxl"),
         dim=5120, num_layers=40, num_heads=40, ffn_dim=13824,
         vae_z_dim=16, vae_spatial_factor=8,       # vace_in_dim=96, mask_pq=8 (Wan2.1 VAE)
         has_pretrained_vace=False,                # SEAM-1: create_vace_from_dit (per expert)
@@ -231,8 +244,8 @@ REGISTRY: dict[str, WanBaseSpec] = {
         first_frame_mode="i2v_vae",               # SEAM-4: Wan2.2 I2V, VAE-concat, no CLIP
         experts=("high", "low"),                  # SEAM-5: dual-expert MoE
         expert_dit_globs={
-            "high": "models/Wan-AI/Wan2.2-I2V-A14B/high_noise_model/diffusion_pytorch_model-*.safetensors",
-            "low": "models/Wan-AI/Wan2.2-I2V-A14B/low_noise_model/diffusion_pytorch_model-*.safetensors",
+            "high": _m("Wan-AI/Wan2.2-I2V-A14B/high_noise_model/diffusion_pytorch_model-*.safetensors"),
+            "low": _m("Wan-AI/Wan2.2-I2V-A14B/low_noise_model/diffusion_pytorch_model-*.safetensors"),
         },
         switch_boundary=0.875,                    # inference expert switch (timestep)
         train_bands={                             # (min, max) timestep-boundary fractions
@@ -251,9 +264,9 @@ REGISTRY: dict[str, WanBaseSpec] = {
     "wan2.2-vace-fun-a14b": WanBaseSpec(
         name="wan2.2-vace-fun-a14b",
         dit_path="",                              # experts -> expert_dit_globs
-        vae_path=f"{_CONVERTED}/Wan2.1_VAE.safetensors",         # Wan2.1 VAE (z=16, s=8)
-        t5_path=f"{_CONVERTED}/models_t5_umt5-xxl-enc-bf16.safetensors",
-        tokenizer_path="models/Wan-AI/Wan2.1-T2V-1.3B/google/umt5-xxl",
+        vae_path=_m(f"{_CONVERTED}/Wan2.1_VAE.safetensors"),         # Wan2.1 VAE (z=16, s=8)
+        t5_path=_m(f"{_CONVERTED}/models_t5_umt5-xxl-enc-bf16.safetensors"),
+        tokenizer_path=_m("Wan-AI/Wan2.1-T2V-1.3B/google/umt5-xxl"),
         dim=5120, num_layers=40, num_heads=40, ffn_dim=13824,
         vae_z_dim=16, vae_spatial_factor=8,       # vace_in_dim=96, mask_pq=8 (Wan2.1 VAE)
         has_pretrained_vace=True,                 # PRETRAINED dual VACE (warm-start)
@@ -261,8 +274,8 @@ REGISTRY: dict[str, WanBaseSpec] = {
         first_frame_mode="vace_reference",        # SEAM-4: VACE reference (in_dim=16 DiT, no i2v)
         experts=("high", "low"),                  # SEAM-5: dual-expert MoE (pretrained)
         expert_dit_globs={
-            "high": "models/PAI/Wan2.2-VACE-Fun-A14B/high_noise_model/diffusion_pytorch_model*.safetensors",
-            "low": "models/PAI/Wan2.2-VACE-Fun-A14B/low_noise_model/diffusion_pytorch_model*.safetensors",
+            "high": _m("PAI/Wan2.2-VACE-Fun-A14B/high_noise_model/diffusion_pytorch_model*.safetensors"),
+            "low": _m("PAI/Wan2.2-VACE-Fun-A14B/low_noise_model/diffusion_pytorch_model*.safetensors"),
         },
         switch_boundary=0.875,
         train_bands={
