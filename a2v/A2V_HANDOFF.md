@@ -4,13 +4,60 @@
 > 这件事的目标、已核实事实、已产出文档、当前代码状态、以及待办与阻塞点。
 > 详细内容散在 `.cache/analysis/` 的各专题文档里，本文给出索引与摘要。
 
-最后更新：2026-06-25（首个正式 World Model §20；训练入口脚本 `run_overfit.sh` 重命名为 **`train.sh`**）。
+最后更新：2026-06-29（**新机器 `/disk/worldmodel` 上跑全量 RoboTwin clean_50 训练**；新增变长数据集能力；`train.sh` 默认值改为 cosine+全精度 AdamW+wandb。详见接手清单最顶 §29）。
 
 > **⚠ 入口改名（2026-06-25）**：统一训练脚本 `a2v/run_overfit.sh` → **`a2v/train.sh`**（名字不再误导,
 > 它早已是所有训练的统一入口,非仅 overfit）。用法不变:`bash a2v/train.sh <base_spec> [env...]`。
 > 用户上手先读 `a2v/README_A2V.md`(已重写为规范的使用指南)。下文历史段里的 `run_overfit.sh`/`run_overfit_<x>.sh` 均指今天的 `train.sh`。
 
 > ## ⭐ 接手清单（新会话先读这一段）
+>
+> ## §29 全量 RoboTwin clean_50 训练（2026-06-29，**新机器 `/disk/worldmodel`**）
+> **本会话在一台不同于历史记录的机器上工作**——历史段里的 `/vepfs/...` + `.venv` 路径不适用本机。
+>
+> **环境（本机，已实测）**
+> - 仓库：`/disk/worldmodel/wangshilong/DiffSynth-Studio`（分支 `a2v`）。
+> - Python：`PY=/disk/worldmodel/uv/envs/a2v/bin/python`（**不是** `.venv`）。有 torch2.5.1/h5py/imageio/bitsandbytes；**无 decord**（prepare 自动回退 imageio）、**无 cv2**（预处理不需要）。
+> - RoboTwin 数据根：`/disk/worldmodel/public_data/RoboTwin2.0_unpacked`（adapter 默认 `/data/...`，**必须传 `--root`**）。
+> - **模型路径统一**：`base_spec.py` 所有权重路径都用 `_m(<rel>)` 拼在**单一根 `_MODELS`** 下，根来自环境变量 **`A2V_MODELS_DIR`**（默认 repo 相对 `models/`），**源码内无任何集群绝对路径**。**跑任何基模前 `export A2V_MODELS_DIR=/disk/worldmodel/public_model`**（已写入三个 sbatch；交互式命令 check_load/infer/eval 也需先 export）。
+>   - **要求的目录布局（`$A2V_MODELS_DIR/` 下，HF/ModelScope 目录名）**：
+>     `Wan-AI/Wan2.2-TI2V-5B/{diffusion_pytorch_model*.safetensors, Wan2.2_VAE.pth, models_t5_umt5-xxl-enc-bf16.pth, google/umt5-xxl}`（ti2v-5b,DiffSynth 直接吃 `.pth`）；
+>     其它基模:`Wan-AI/Wan2.1-{VACE-1.3B,T2V-1.3B,I2V-14B-480P}/…`、`Wan-AI/Wan2.2-I2V-A14B/{high,low}_noise_model/…`、`PAI/Wan2.2-VACE-Fun-A14B/…`、`DiffSynth-Studio/Wan-Series-Converted-Safetensors/{Wan2.1_VAE.safetensors, models_t5_umt5-xxl-enc-bf16.safetensors}`。
+>   - 本机:ti2v-5b 全部就位于 `/disk/worldmodel/public_model/Wan-AI/Wan2.2-TI2V-5B/`(故 `A2V_MODELS_DIR=/disk/worldmodel/public_model`);其它基模若要跑需保证在同一根下(否则按需 symlink 或改 `A2V_MODELS_DIR`)。
+> - **GPU 只能走 slurm**（分区 `gpu`，8×A100-80GB/节点）。账号 `sjtuadmin` 多人共享。
+>
+> **⚠ 集群坑（务必）**
+> - **node `…-118` 被非 slurm 的 VLM 服务常驻**（shaoy `LocalVLMServer/worker.py`，~34GB/卡，已跑 8 天）。slurm 显示它 idle 却会把作业调上去 → **OOM**。提交 GPU 作业一律加 `#SBATCH --exclude=ZJYKP-A100x8-INTEL-114-118 --exclusive`，并先 `nvidia-smi` 核实"slurm-idle"节点是否真干净。
+> - 同事 ziyang 跑独立 fork（`/disk/worldmodel/ziyang/a2v_pkg`、spec `wan2.2-ti2v-5b-khl`、480×832、5 任务子集、`first_n` 采样），与本轨道不冲突但抢节点；shaoy 占 118。
+>
+> **新增能力：变长数据集（避免定长丢/浪费 episode）**
+> - `prepare.py` 加 `--max_num_frames C`（+`--min_num_frames`，默认 49）：每集渲染 `min(自身最大4n+1, C)`，低于下限丢弃。`validate.py` 加 `--max_num_frames`（放宽为 4n+1≤C 且双流等长）。
+> - 新驱动 `a2v/data/build_robotwin_all.sh`：一条命令按磁盘发现某 `SUFFIX` 全部 `<task>/<robot>` 变体 → adapter→prepare→merge→validate，纯 CPU。env：`SUFFIX MAX_FRAMES MIN_FRAMES H W FRAMES JOBS PY ROOT OUT DRY_RUN`。
+> - 安全性依据：训练/编码 DataLoader 用 `collate_fn=lambda x:x[0]`（等效 bs=1，`runner.py:50,96`），list 分支按 PNG 列表原长加载、`--num_frames` 对 list 是 no-op；唯一硬约束每 clip 4n+1。
+>
+> **已产出数据（本机）**
+> - 数据集 `.cache/a2v_robotwin/clean50_480x640_c121/`（**2.2 TB**）：全部 clean_50、**11,329 行变长**（49–121，cap=121）、480×640、`metadata.jsonl`。（11,500 中丢 171 个 <49 帧。）
+> - 编码缓存 `.cache/a2v_robotwin/cache_ti2v_480_c121/`（**3.9 TB**）：8 rank、**11,336 个 .pth**（VAE/T5 编码，cache-train 直接读）。**缓存与优化器/LR/logger 无关 → 改这些可直接复用,免重编**；全部训完且不再重训可删省 3.9T。
+>
+> **train.sh 默认值已改（最强/最稳，全部可 env 覆盖）**
+> - `LR_SCHEDULE` 默认 **cosine**（warmup→衰减，治 loss 震荡）；`LOGGER` 默认 **wandb**；优化器三档 **`OPTIMIZER=adamw|adamw_offload|adam8bit`**，默认 `adamw`（全精度无 offload，**非 8-bit**），大模型 `adamw_offload`，`adam8bit` 仅兜底。`train.sh` 还支持 `PY=` 覆盖（原写死 `.venv/bin/accelerate`）。
+> - **⚠ wandb headless**：新版 wandb SDK **不读 `~/.netrc`**，slurm 作业里不设 key 会在第一步日志时崩（`UsageError: No API key configured`）。必须在 sbatch 里 `export WANDB_API_KEY=<key>`（已加入 `train_cosine.sbatch`；entity `winsleo-sjtu`(wangshilong)、project `a2v-ti2v-5b`）。或 `export WANDB_MODE=offline` 走本地后 `wandb sync`。
+> - **显存实测**：ti2v-5b 480×640/121，`adamw` 无 offload ~77GB（太险，8 卡 DDP 易 OOM）；`adamw_offload` ~44–60GB（安全）；8-bit ~46GB。
+>
+> **训练产物 / 状态**
+> - **Run-1（已完成）**：constant LR + 8-bit Adam，`models/train/a2v_clean50_ti2v_480_c121/step-7085.safetensors`（5 epochs，~10h）。**loss 有 spike/震荡**（疑似 constant LR）。
+> - **Run-2（进行中,job 1394）**：cosine + **adamw_offload** + wandb，5 epochs，复用上面 cache，输出 `models/train/a2v_clean50_ti2v_480_c121_cosine/`。sbatch：`.cache/a2v_robotwin/train_logs/train_cosine.sbatch`（含 `--exclude=…118 --exclusive` + `WANDB_API_KEY`）。排障链：①②两次落到蹭卡的 118 → OOM；③排除 118 后在干净节点 116 跑通整步、但 wandb 无 key 崩（已修，见上）；④注入 key 重交=**1394**，干净节点运行中。`adamw_offload` 显存已验证够。
+> - sbatch 模板都在 `.cache/a2v_robotwin/train_logs/`（`encode.sbatch`/`train.sbatch`/`train_cosine.sbatch`）；务必 `export PYTHONUNBUFFERED=1` 否则日志不刷。
+>
+> **新会话续接怎么做**
+> 1. `squeue -u sjtuadmin` 看 1389（或新作业）状态；日志 `.cache/a2v_robotwin/train_logs/train_cosine-<jobid>.out`；ckpt 目录 `models/train/a2v_clean50_ti2v_480_c121_cosine/`。
+> 2. 若需重交训练：`sbatch .cache/a2v_robotwin/train_logs/train_cosine.sbatch`（已排除 118）。复用 cache，免重编码。
+> 3. 训练完做 **Step 4 因果门控**（README）：`infer_a2v` real/none/shuffle + `causal_metrics`，或 `eval_multiep`。注意**当初未切 held-out**（全作训练），严格泛化需另抽 episode 建小评估集。
+> 4. wandb：project `a2v-ti2v-5b`，entity `winsleo-sjtu`(wangshilong)，看 cosine vs constant 的 loss 对比。
+> - 详细：项目记忆 `a2v-cluster-setup` / `a2v-variable-length-prep`；README 已更新（变长 + build_robotwin_all + cache-train + 新默认）。
+>
+> ---
+>
 > **🌍 首个正式 A2V World Model PASS（2026-06-24，§20）**：Wan2.2-TI2V-5B、**多任务多机器人、~480p**。
 > 2 任务(adjust_bottle/beat_block_hammer) × 3 机器人(aloha-agilex/franka/ur5) × randomized_500 →
 > **train 2700 / held-out 300**，480×640/49 帧。TI2V VAE 16× → 480×640 与 240×320 I2V 同 30×40 latent（4× 像素、同算量）。

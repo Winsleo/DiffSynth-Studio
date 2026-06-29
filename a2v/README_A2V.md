@@ -101,6 +101,7 @@ $PY -m a2v.data.robotwin_adapter --task <task> --robot_mode <robot_mode> \
 $PY -m a2v.data.prepare --manifest <work_dir>/manifest.jsonl --output_dir <dataset_dir> \
   --height H --width W --num_frames N \         # N = 4n+1; H,W divisible by 16 (Wan2.1) / 32 (Wan2.2)
   --resize_mode stretch --gripper_z_offset 0 --radius_mode physical \
+  [--max_num_frames C --min_num_frames 49] \    # variable-length: each ep -> largest 4n+1 <= min(its len, C)
   [--write_overlay] [--skip_short]              # overlay = debug; skip_short = drop too-short episodes
 ```
 
@@ -134,6 +135,44 @@ $PY -m a2v.data.prepare --manifest .cache/a2v_robotwin/allep_work/manifest.jsonl
 To split train / held-out within one task, run the adapter twice with complementary ranges
 (`--episodes_range 0-39` and `40-49`) into separate `--work_dir`/`--output_dir`.
 
+### Variable-length episodes (`--max_num_frames`)
+
+RoboTwin episodes vary a lot in length (often 50–300+ frames). A fixed `--num_frames N` either
+drops every episode shorter than `N` (with `--skip_short`) or wastes the extra frames of longer
+ones. Instead, pass `--max_num_frames C` (a cap, `4n+1`): **each episode is rendered at the largest
+`4n+1 ≤ min(its length, C)`** — long episodes get the full `C`-frame window, shorter ones keep as
+many frames as they have, and only those below `--min_num_frames` (default `49`) are dropped. This
+keeps far more data while giving every clip its longest feasible temporal window.
+
+This is safe because A2V stores each stream as a PNG list and training loads the list **as-is**
+(batch size 1, no cross-clip stacking), so rows may differ in length; the only hard rule is that
+each clip is `4n+1` (VAE temporal factor). When a dataset is variable-length, also pass
+`--max_num_frames C` to `a2v.data.validate` (it then checks `4n+1 ≤ C` and that `video`/`vace_video`
+stay equal-length, instead of requiring an exact `N`).
+
+### Whole dataset in one command — `build_robotwin_all.sh`
+
+Builds **one** dataset (no split) from every `<task>/<robot>_<SUFFIX>` variant found on disk for a
+given `SUFFIX`, running adapter → prepare → merge → validate in parallel. Variants are discovered by
+globbing the data root, so robots missing for some tasks are simply skipped. Pure CPU.
+
+```bash
+# variable-length, cap 121, all clean_50 variants
+JOBS=64 MAX_FRAMES=121 MIN_FRAMES=49 SUFFIX=clean_50 \
+  OUT=.cache/a2v_robotwin/clean50_480x640_c121 \
+  bash a2v/data/build_robotwin_all.sh
+# fixed-length instead: drop MAX_FRAMES, set FRAMES=49 ;  preview only: DRY_RUN=1
+```
+
+| env var | meaning |
+| --- | --- |
+| `SUFFIX` | data subset, e.g. `clean_50` (default) or `randomized_500` |
+| `MAX_FRAMES` `MIN_FRAMES` | set `MAX_FRAMES` → variable-length (cap / floor); unset → fixed `FRAMES` |
+| `H` `W` `FRAMES` | resolution; `FRAMES` only used in fixed mode |
+| `JOBS` | parallel variants (default 48) |
+| `PY` `ROOT` `OUT` | python / RoboTwin root / output dataset dir |
+| `DRY_RUN=1` | print the variants and example commands, run nothing |
+
 ### Multi-task / multi-robot (with automatic train/held-out split)
 
 `build_dataset.sh` fans out adapter+prepare per (task, robot) variant in parallel, then merges
@@ -160,7 +199,8 @@ Cheap gates that catch data/model problems before you commit GPU hours.
 # data is well-formed for this base (no model weights needed)
 $PY -m a2v.data.validate --base_spec <spec> \
   --dataset_base_path <dataset_dir> --dataset_metadata_path <dataset_dir>/metadata.jsonl \
-  --height H --width W --num_frames N
+  --height H --width W --num_frames N \
+  [--max_num_frames C]                  # add for variable-length datasets (checks 4n+1 <= C)
 
 # weights load + the VACE branch builds correctly for this base
 $PY -m a2v.check_load        --base_spec <spec>
@@ -205,10 +245,11 @@ state dict otherwise).
 | `CACHE_TRAIN=1` `CACHE_DIR=` | train from a pre-encoded cache (see below) |
 | `RESUME=<ckpt>` | resume a long run |
 | `EXPERT=high\|low` | **required** for `*-a14b` (selects the MoE expert + its timestep band) |
-| `LR_SCHEDULE=constant\|cosine` | default `constant`; `cosine` = linear warmup → cosine decay (then `LR` is the **peak**) |
+| `OPTIMIZER=adamw\|adamw_offload\|adam8bit` | default `adamw` (full fp32 AdamW, no offload — strongest, fits 1.3B/5B). `adamw_offload` = full AdamW + activation offload (default for 14B/A14B). `adam8bit` = last-resort low-VRAM. **None default to 8-bit.** |
+| `LR_SCHEDULE=cosine\|constant` | default `cosine` = linear warmup → cosine decay (then `LR` is the **peak**); `constant` = flat lr |
 | `WARMUP=<steps>` | cosine warmup steps; `0` → 3% of total (`num_epochs × len(dataset)`) |
 | `LR_MIN_RATIO=<frac>` | cosine final lr as a fraction of peak (default `0`) |
-| `LOGGER=tensorboard,…` | logging backends, comma list: `tensorboard` (default) `wandb` `swanlab` `none`. `WANDB_PROJECT`/`SWANLAB_PROJECT` name the project |
+| `LOGGER=wandb,…` | logging backends, comma list: `wandb` (default) `tensorboard` `swanlab` `none`. `WANDB_PROJECT`/`SWANLAB_PROJECT` name the project |
 | `LOG_EVERY=<n>` | log `lr`/`grad_norm`/`throughput_it_s`/`gpu_mem_gb` every `n` steps (default `10`; `loss` every step) |
 | `GRAD_NORM=0\|1` | log grad norm on logging steps, computed before `zero_grad` (default `1`) |
 | `SAMPLE_EVERY=<n>` | periodic in-training generation cadence (`0`=off); plus `SAMPLE_ROWS=` `SAMPLE_CONTROLS=` `SAMPLE_FRAMES=` `SAMPLE_STEPS=` |
@@ -395,7 +436,8 @@ a2v/
   eval_multiep.py     multi-episode generalization evaluator (model loaded once)
   causal_metrics.py   MAE-GT / motion / real-vs-none gate metrics
   check_load.py       check_provision.py  check_parity.py   pre-flight gates
-  data/               robotwin_adapter, prepare, build_dataset.sh, operators, validate, smoke
+  data/               robotwin_adapter, prepare (+ --max_num_frames variable-length), operators, validate, smoke
+                      build_dataset.sh (multi-task train/heldout split), build_robotwin_all.sh (whole-suffix single split)
   render/             traj_map, action_io, check_projection
   README_A2V.md       this guide
   A2V_HANDOFF.md      current status + handoff checklist + quick reference
