@@ -37,9 +37,9 @@ All three training loggers are installed: `tensorboard 2.20.0` (default), `wandb
 git clone <this-repo> DiffSynth-Studio && cd DiffSynth-Studio
 git checkout a2v                       # the A2V branch
 
-# 1. create the venv (uv; or: python3.11 -m venv .venv)
-uv venv --python 3.11.9 .venv          #  -> .venv/
-#   plain venv alternative:  python3.11 -m venv .venv
+# 1. create the venv. NOTE: `uv venv` does NOT install pip unless you pass --seed.
+uv venv --seed --python 3.11.9 .venv   #  -> .venv/ (with pip)
+#   plain venv alternative (also ships pip):  python3.11 -m venv .venv
 
 # 2. install the exact pinned set
 .venv/bin/python -m pip install -U pip
@@ -58,22 +58,35 @@ CUDA_VISIBLE_DEVICES=0 .venv/bin/python -m a2v.check_load --base_spec wan2.1-vac
 > at import time — and so the A2V code under `a2v/` (which never modifies `diffsynth/`) picks up the
 > repo, not a stale site-packages copy. Do not `pip install diffsynth` from PyPI.
 
+> **No pip in the venv?** `uv venv` without `--seed` creates a pip-less venv (then
+> `.venv/bin/python -m pip ...` fails with "No module named pip"). Either recreate with
+> `uv venv --seed`, or skip pip entirely and let uv install into it — `uv pip install -r
+> a2v/requirements.lock.txt` then `uv pip install -e .` (steps 2-3 above, no step-1 `-U pip` needed).
+
+> **Installing the lock with `uv pip`?** The lock's `--extra-index-url` (PyTorch cu121) trips uv's
+> default `first-index` strategy: some pure-Python deps (e.g. `certifi`) exist on the PyTorch index
+> but only at old versions, so uv refuses with *"no version of certifi==... ; unsatisfiable"*. Add
+> `--index-strategy unsafe-best-match` so uv considers all indexes (matches pip's behavior):
+> `uv pip install -r a2v/requirements.lock.txt --index-strategy unsafe-best-match`. Plain pip and
+> `uv venv --seed` + `python -m pip` are unaffected.
+
 ## Reproduce — relaxed (different CUDA / Python)
 
 If the target box has a different CUDA, install a matching torch first, then the rest loosely:
 
 ```bash
-uv venv --python 3.11 .venv
+uv venv --seed --python 3.11 .venv
 # pick the wheel for your CUDA, e.g. cu124:
 .venv/bin/python -m pip install torch==2.5.1 torchvision==0.20.1 \
   --index-url https://download.pytorch.org/whl/cu124
 .venv/bin/python -m pip install -e .          # pulls deps from pyproject.toml
-.venv/bin/python -m pip install bitsandbytes tensorboard wandb swanlab
+.venv/bin/python -m pip install bitsandbytes tensorboard wandb swanlab "setuptools<81"
 ```
 
 Note `bitsandbytes`, `tensorboard`, `wandb` and `swanlab` are **not** in `pyproject.toml` but are
 used by A2V (8-bit Adam for the 14B/5B/A14B bases, and the training loggers), so install them
-explicitly. wandb/swanlab pin `protobuf<7`.
+explicitly. wandb/swanlab pin `protobuf<7`; `setuptools<81` keeps `pkg_resources` alive for
+TensorBoard (see gotchas).
 
 ## Optional loggers (installed)
 
@@ -103,6 +116,13 @@ writes under `<OUT>/swanlab_log/` and likewise has its own login for cloud sync.
 - **numpy 2.x**: TensorBoard's `add_video` breaks under numpy>=2 (`reshape ... newshape`); the A2V
   logger already falls back to an image strip, so this is handled — just don't downpin numpy
   expecting video tiles.
+- **TensorBoard needs `setuptools<81`.** `tensorboard 2.20.0` (current PyPI latest) still does
+  `import pkg_resources` in `tensorboard/default.py`, but setuptools **81+ removed `pkg_resources`**,
+  so on a fresh box `tensorboard` crashes with `ModuleNotFoundError: No module named 'pkg_resources'`
+  (and `uv venv` ships no setuptools at all). Fix: `uv pip install "setuptools<81"` (we pin
+  `80.10.2`). You'll still see a one-line `UserWarning: pkg_resources is deprecated` at startup —
+  harmless, ignore it (or `PYTHONWARNINGS=ignore::UserWarning`). The upstream fix (tensorboard PR
+  #7057, switches to `importlib.metadata`) isn't in any release yet; drop the pin once it ships.
 - Model weights are **not** part of this env; they are downloaded/converted separately (see
   `A2V_HANDOFF.md`). This doc covers only the Python environment.
 
