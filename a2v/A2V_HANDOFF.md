@@ -49,7 +49,7 @@
 > - **Run-2（进行中,job 1394）**：cosine + **adamw_offload** + wandb，5 epochs，复用上面 cache，输出 `models/train/a2v_clean50_ti2v_480_c121_cosine/`。sbatch：`.cache/a2v_robotwin/train_logs/train_cosine.sbatch`（含 `--exclude=…118 --exclusive` + `WANDB_API_KEY`）。排障链：①②两次落到蹭卡的 118 → OOM；③排除 118 后在干净节点 116 跑通整步、但 wandb 无 key 崩（已修，见上）；④注入 key 重交=**1394**，干净节点运行中。`adamw_offload` 显存已验证够。
 > - sbatch 模板都在 `.cache/a2v_robotwin/train_logs/`（`encode.sbatch`/`train.sbatch`/`train_cosine.sbatch`）；务必 `export PYTHONUNBUFFERED=1` 否则日志不刷。
 >
-> **Run-2 实时状态（2026-06-29 ~16:00）**：1394 RUNNING@node116，**~10 s/步**（adamw_offload 约为 8-bit 的 2×），已出 `step-500`，5 epoch≈7085 步 → 预计 **~20h** 跑完（48h 时限内，每 500 步存 ckpt）。wandb run：**https://wandb.ai/winsleo-sjtu/a2v-ti2v-5b/runs/9weppi64**（`helpful-jazz-1`）。
+> **Run-2 已完成（2026-06-30 00:37，干净退出）**：1394 跑完 5 epoch，最终 ckpt `models/train/a2v_clean50_ti2v_480_c121_cosine/step-7085.safetensors`（共 15 个，~10h，adamw_offload ~10 s/步）。wandb run：**https://wandb.ai/winsleo-sjtu/a2v-ti2v-5b/runs/9weppi64**（`helpful-jazz-1`，看 cosine loss 是否比 Run-1 constant 更平滑）。**下一步：Step 4 因果门控评估 + 与 Run-1 对比。**
 >
 > **代码已提交**（分支 `a2v`，author `winsleo <winsleo@foxmail.com>`，**未 push**）：6 个提交 `344203a..20c6e9d`——变长 prepare/validate、build_robotwin_all.sh、base_spec 路径统一(A2V_MODELS_DIR)、train.sh 默认值(cosine/adamw/wandb)+PY、README/HANDOFF/ENVIRONMENT 文档。`.cache/` 与 `models/` 为 gitignore（数据/cache/ckpt 不入库）。
 >
