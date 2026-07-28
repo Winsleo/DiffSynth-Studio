@@ -18,6 +18,8 @@ T1 path (pretrained vace already loaded; mask_pq=8 == the hardcoded value) — w
 
 from __future__ import annotations
 
+import os
+
 import torch
 
 from a2v.base_spec import WanBaseSpec
@@ -197,7 +199,21 @@ def provision_a2v(pipe, spec: WanBaseSpec):
         vace = ensure_vace(pipe, spec)
     if not install_vace_unit(pipe, spec.mask_pq):
         raise RuntimeError("No WanVideoUnit_VACE found in pipe.units; cannot install parameterized VACE unit.")
+    _maybe_install_action_injection(pipe, spec)
     return vace
+
+
+def _maybe_install_action_injection(pipe, spec: WanBaseSpec):
+    """Scheme A (opt-in via env A2V_ACTION=1): attach the numeric-action AdaLN
+    bypass to the VACE branch. Default off -> provisioning is bit-identical to the
+    trajectory-map-only baseline (zero side effect; parity gate unaffected)."""
+    if os.environ.get("A2V_ACTION", "0") != "1":
+        return
+    from a2v.action_inject import install_action_injection
+
+    action_dim = int(os.environ.get("A2V_ACTION_DIM", "16"))
+    chunk_size = int(os.environ.get("A2V_ACTION_CHUNK", str(spec.vae_temporal_factor)))
+    install_action_injection(pipe, spec, action_dim=action_dim, chunk_size=chunk_size)
 
 
 __all__ = ["create_vace_from_dit", "build_bare_vace", "ensure_vace", "ensure_vace_experts", "provision_a2v"]

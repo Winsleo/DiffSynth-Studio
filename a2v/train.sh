@@ -175,6 +175,27 @@ else  # image: i2v_concat / ti2v_fused -> input_image (derived from video[0] by 
   EXTRA_INPUTS="vace_video,input_image"
 fi
 
+# Optional override of the per-spec VACE training regime (lora|vace). Use FORCE_TRAIN_MODE=vace
+# to run a pretrained-VACE base (e.g. vace-1.3b) as full-param instead of LoRA — needed to keep
+# an ablation baseline on the SAME regime as the A2V_ACTION arm (which forces vace).
+case "${FORCE_TRAIN_MODE:-}" in
+  lora|vace) TRAIN_MODE="$FORCE_TRAIN_MODE" ;;
+esac
+
+# Scheme A (opt-in): numeric-action AdaLN injection. Add the [T,16] action stream and
+# force full-param VACE training so the newly attached ActionEmbedder params are
+# trainable & saved (LoRA targets do not cover a freshly-added module). Raw-dataset
+# path only; cache-train action support is a follow-up.
+if [ "${A2V_ACTION:-0}" = "1" ]; then
+  export A2V_ACTION
+  DATA_FILE_KEYS="$DATA_FILE_KEYS,action"
+  EXTRA_INPUTS="$EXTRA_INPUTS,action"
+  if [ "$TRAIN_MODE" = "lora" ]; then
+    echo "[train] A2V_ACTION=1 -> forcing full-param VACE (TRAIN_MODE=vace) so action_embedder trains/saves."
+    TRAIN_MODE=vace
+  fi
+fi
+
 # dataset source: encoded cache (only DiT loaded; encoders + their inputs skipped) vs raw PNG dataset
 DATA_ARGS=()
 if [ "$CACHE_TRAIN" = "1" ]; then

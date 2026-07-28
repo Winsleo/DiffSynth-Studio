@@ -301,6 +301,12 @@ def build_sample(
     reference_name = "00000.png"
     Image.fromarray(target_frames[0]).save(reference_dir / reference_name, compress_level=0)
 
+    # Scheme A: persist the raw per-frame [nf,16] action as a first-class dataset
+    # artifact (frame-locked to video/vace_video), so numeric-action injection can
+    # load it per-row and it survives cache-train (unlike the upstream action_path).
+    action_name = "actions.npy"
+    np.save(sample_dir / action_name, np.asarray(actions, dtype=np.float32))
+
     if args.write_overlay:
         save_overlay_sequence(target_frames, vace_frames, overlay_dir, args.overlay_alpha)
 
@@ -309,6 +315,7 @@ def build_sample(
         "prompt": resolve_prompt(item, args.default_prompt),
         "vace_video": [str(Path(sample_name) / "vace_video" / name) for name in vace_rel],
         "vace_reference_image": str(Path(sample_name) / "reference" / reference_name),
+        "action": str(Path(sample_name) / action_name),
         "frame_indices": frame_indices,
         "source_video": str(video_path),
         "action_path": str(action_path),

@@ -34,7 +34,7 @@ from diffsynth.core.data.operators import LoadVideo, LoadAudio, ImageCropAndResi
 from diffsynth.diffusion import *  # noqa: E402,F401,F403  (ModelLogger, launch_*_task, ...)
 
 from a2v.base_spec import get_spec  # noqa: E402
-from a2v.data.operators import frame_list_video_operator  # noqa: E402
+from a2v.data.operators import NpyToTensor, frame_list_video_operator  # noqa: E402
 from a2v.provision import ensure_vace, provision_a2v  # noqa: E402
 from a2v.train_logging import A2VModelLogger, PeriodicSampler, a2v_launch_training_task  # noqa: E402
 
@@ -218,6 +218,8 @@ def main() -> None:
             "animate_face_video": ToAbsolutePath(args.dataset_base_path) >> LoadVideo(args.num_frames, 4, 1, frame_processor=ImageCropAndResize(512, 512, None, 16, 16)),
             "input_audio": ToAbsolutePath(args.dataset_base_path) >> LoadAudio(sr=16000),
             "wantodance_music_path": ToAbsolutePath(args.dataset_base_path),
+            # Scheme A: numeric action is a [T,16] .npy -> bypass the image operator.
+            "action": ToAbsolutePath(args.dataset_base_path) >> NpyToTensor(),
         },
     )
 

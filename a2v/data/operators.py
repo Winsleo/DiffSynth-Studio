@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import numpy as np
+import torch
+
 from diffsynth.core.data.operators import (
+    DataProcessingOperator,
     ImageCropAndResize,
     LoadGIF,
     LoadImage,
@@ -13,6 +17,22 @@ from diffsynth.core.data.operators import (
     ToAbsolutePath,
     ToList,
 )
+
+
+class NpyToTensor(DataProcessingOperator):
+    """Load a ``.npy`` file (absolute path in) into a torch tensor.
+
+    Used for the numeric ``action`` key (Scheme A): a plain ``[T,16]`` array that
+    must bypass the image-only ``frame_list_video_operator``. Compose after
+    ``ToAbsolutePath``: ``ToAbsolutePath(base) >> NpyToTensor()``.
+    """
+
+    def __init__(self, dtype=torch.float32):
+        self.dtype = dtype
+
+    def __call__(self, data):
+        arr = np.load(data)
+        return torch.tensor(arr, dtype=self.dtype)
 
 
 def frame_list_video_operator(
@@ -64,4 +84,4 @@ def frame_list_video_operator(
     ])
 
 
-__all__ = ["frame_list_video_operator"]
+__all__ = ["frame_list_video_operator", "NpyToTensor"]

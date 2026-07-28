@@ -24,6 +24,8 @@ def parse_args() -> argparse.Namespace:
                              "accept any 4n+1 length <= this cap (and video/vace_video must match each other).")
     parser.add_argument("--base_spec", default=None, help="Optional WanBaseSpec name; derives spatial/time divisibility factors.")
     parser.add_argument("--max_items", type=int, default=10)
+    parser.add_argument("--check_action", action="store_true",
+                        help="Scheme A: also verify each row's action .npy exists and is [T,16] frame-locked to video.")
     return parser.parse_args()
 
 
@@ -90,6 +92,18 @@ def main() -> None:
             raise AssertionError(f"row {idx}: reference size {image_size(ref[0])}, expected {(args.height, args.width)}")
         if not data.get("prompt"):
             raise AssertionError(f"row {idx}: empty prompt")
+        if args.check_action:
+            import numpy as np
+            action_rel = data.get("action")
+            if not action_rel:
+                raise AssertionError(f"row {idx}: --check_action set but row has no 'action' key")
+            action_arr = np.load(Path(args.dataset_base_path) / action_rel)
+            if action_arr.ndim != 2 or action_arr.shape[1] != 16:
+                raise AssertionError(f"row {idx}: action shape {action_arr.shape}, expected [T,16]")
+            if action_arr.shape[0] != len(data["video"]):
+                raise AssertionError(
+                    f"row {idx}: action has {action_arr.shape[0]} frames but video has "
+                    f"{len(data['video'])} - action must stay frame-locked to video")
         print(
             f"row {idx}: ok video={len(data['video'])} vace={len(data['vace_video'])} "
             f"size={image_size(data['video'][0])} prompt={data['prompt']!r}"

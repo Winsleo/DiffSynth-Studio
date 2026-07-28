@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 
 import torch
@@ -170,6 +171,19 @@ def _control_vace_video(vace_video: list[Image.Image], control: str, width: int,
     raise ValueError(f"unknown control: {control}")
 
 
+def _control_action(action: torch.Tensor, control: str) -> torch.Tensor:
+    """Apply the same causal control to the numeric action channel as to the
+    trajectory map, so the gate exercises both: real=as-is, none=zeros (no action),
+    shuffle=time-reversed."""
+    if control == "real":
+        return action
+    if control == "none":
+        return torch.zeros_like(action)
+    if control == "shuffle":
+        return torch.flip(action, dims=[0])
+    raise ValueError(f"unknown control: {control}")
+
+
 def first_frame_kwargs(spec, ref: Image.Image) -> dict:
     # SEAM-4 first frame: route `ref` (= GT frame 0, dataset invariant I4) by base mode.
     #   * i2v_concat (I2V-14B, T4): `input_image` builds CLIP + VAE concat conditioning.
@@ -194,6 +208,18 @@ def generate_one(pipe, spec, row: dict, dataset: Path, control: str, height: int
     vace_video = load_frames(dataset, row["vace_video"][:num_frames])
     vace_video = _control_vace_video(vace_video, control, width, height)
     ref = Image.open(dataset / row["vace_reference_image"]).convert("RGB")
+
+    # Scheme A: when numeric-action injection is active (A2V_ACTION=1 -> provision
+    # installed it), load the raw [T,16] action, apply the matching causal control,
+    # and stash it on the VACE branch(es). No-op when injection is off.
+    if os.environ.get("A2V_ACTION", "0") == "1" and row.get("action"):
+        import numpy as np
+        from a2v.action_inject import stash_action
+
+        act = torch.tensor(np.load(dataset / row["action"]), dtype=torch.float32)[:num_frames]
+        act = _control_action(act, control)
+        stash_action(pipe, act.unsqueeze(0))
+
     extra = {} if num_inference_steps is None else {"num_inference_steps": num_inference_steps}
     return pipe(
         prompt=row.get("prompt", "robot arm manipulation"),
