@@ -4,13 +4,50 @@
 > 这件事的目标、已核实事实、已产出文档、当前代码状态、以及待办与阻塞点。
 > 详细内容散在 `.cache/analysis/` 的各专题文档里，本文给出索引与摘要。
 
-最后更新：2026-06-29（**新机器 `/disk/worldmodel` 上跑全量 RoboTwin clean_50 训练**；新增变长数据集能力；`train.sh` 默认值改为 cosine+全精度 AdamW+wandb。详见接手清单最顶 §29）。
+最后更新：2026-07-28（**第三台机器 `/pfs/DiffSynth-Studio`**；实现并 ablation 了「方案 A：数值动作 AdaLN 旁路注入」——全部落在 `a2v/`，`diffsynth/` 未动。单 ep 过拟合 ablation 结论：数值动作**没帮上忙、反而变差**（详见接手清单最顶 §30）。之前 §29 = 全量 RoboTwin clean_50 训练；`train.sh` 默认 cosine+全精度 AdamW+wandb）。
 
 > **⚠ 入口改名（2026-06-25）**：统一训练脚本 `a2v/run_overfit.sh` → **`a2v/train.sh`**（名字不再误导,
 > 它早已是所有训练的统一入口,非仅 overfit）。用法不变:`bash a2v/train.sh <base_spec> [env...]`。
 > 用户上手先读 `a2v/README_A2V.md`(已重写为规范的使用指南)。下文历史段里的 `run_overfit.sh`/`run_overfit_<x>.sh` 均指今天的 `train.sh`。
 
 > ## ⭐ 接手清单（新会话先读这一段）
+>
+> ## §30 方案 A：数值动作 AdaLN 旁路注入 + ablation（2026-07-28，**第三台机器 `/pfs/DiffSynth-Studio`**）
+> **动机**：当前 A2V 的动作条件是「16D 动作 → 2D 轨迹图 → VACE 图控分支」。这条链路（3D→2D 投影→VAE 压缩）
+> 对**深度/姿态/夹爪**有损。假设：**并联一路无损的数值动作 AdaLN 调制**能补回精度。方案 A 是最轻量实现
+> （~14M @1.3B），并做 ablation 验证。**硬约束（用户确认）：只改 `a2v/`，绝不动 `diffsynth/`；ablation 基座 = `wan2.1-vace-1.3b`。**
+>
+> **环境（本机，第三台，与 §29 `/disk/worldmodel`、历史 `/vepfs` 均不同）**
+> - 仓库：`/pfs/DiffSynth-Studio`（分支 `a2v`）。GPU 本地可用（非 slurm），但**容器 PID namespace**：`nvidia-smi` 显示的是宿主 PID（shell 里 `kill` 报 No such process），要杀自己的进程得从 `/proc/*/cmdline` 找 in-namespace PID。共享硬件，注意别误杀别人的常驻作业。
+> - Python：`PY=/root/miniforge/envs/wm/bin/python`（conda env `wm`，torch 2.7.1 + diffsynth）。另有 env `anypos`（有 h5py 但**无** diffsynth）。`wm` 曾缺 h5py/librosa，已 `pip install --index-url https://pypi.org/simple` 补上（默认 baidubce 镜像失败）。
+> - 模型根：`/pfs/DiffSynth-Studio/models`（HF/ModelScope 目录名，同 §29 布局）。vace-1.3b DiT + converted VAE/T5 已就位。
+> - 下载代理（补权重时）：`export http_proxy=http://10.66.65.186:18000 https_proxy=http://10.66.65.186:18000`。
+> - RoboTwin2 数据：`/mnt/bos/prime-dataset/RoboTwin2/<task>/<robot_mode>/{data,video}`。
+>
+> **代码状态（全部 `a2v/`，`diffsynth/` git 确认未改）**
+> - 新增 **`a2v/action_inject.py`**（核心）：`ActionEmbedder`（`Linear(4·A→dim)→SiLU→Linear(dim→6·dim)`，**proj_out 零初始化** → 启用瞬间贡献为 0，parity 保持）；`action_vace_forward`/`action_vace_block_forward`（`VaceWanModel`/`VaceWanAttentionBlock`+`DiTBlock` 的 **verbatim 合并复刻**，仅加 6 路 action chunk）；`install_action_injection`（attach embedder + `types.MethodType` 换 vace/block forward + 包装 `pipe.model_fn`，幂等）；`stash_action`（推理入口）。**只调制可训练的 VACE 分支，冻结 DiT 不碰。**
+> - 改动：`provision.py`（`A2V_ACTION=1` 时 `install_action_injection`）；`data/prepare.py`（存 `actions.npy` + metadata `action` 键）；`data/operators.py`（`NpyToTensor`）；`train_a2v.py`（注册 `action` special operator）；`train.sh`（`A2V_ACTION=1` 追加 action 流 + 强制全参 vace；新增 `FORCE_TRAIN_MODE` 覆盖）；`infer_a2v.py`（`--control` 对 action 同步 real/none/shuffle 后 `stash_action`）；`data/validate.py`（`--check_action`）。
+> - **对齐（最大风险点，已实测正确）**：VACE conv 输出时间维 `f'`=reference+video latent；动作 4:1 分组 `[T,16]→[n_chunks,64]`，`n_chunks=(T-1)//4`；前置 `n_lead=f'-n_chunks` 帧零调制（reference + 条件帧 0）。ep0 实测 `f'=30, n_chunks=28, n_lead=2` 正确（`A2V_ACTION_DEBUG=1` 打印）。
+> - **已修 bug**：`CheckpointError`（recompute 形状不符）——action_mod 必须作为**显式位置参数**穿过 `gradient_checkpoint_forward`（不能走 block 属性再清空，否则 backward 重算形状 [1,1,dim] vs forward [1,L,dim]）。
+>
+> **Ablation 结果（单 ep 过拟合，`wan2.1-vace-1.3b`，两臂均全参 VACE `FORCE_TRAIN_MODE=vace`，1000 步，113 帧/240×320）**
+> | Arm | REAL MAE-GT | NONE MAE-GT | real-vs-none | REAL motion (GT=4.49) |
+> | --- | --- | --- | --- | --- |
+> | **B 基线**（仅轨迹图） | **15.51** | 36.81 | 31.43 | 4.85（ratio 1.08，NONE 静止 0.64） |
+> | **A+num**（轨迹图+数值 AdaLN） | 25.68 | 37.34 | 30.67 | 7.38（ratio 1.64，NONE 移动 2.51） |
+>
+> **结论**：在这个门上，**数值动作没帮上忙，反而更差**（REAL MAE 15.51→25.68，运动过冲 ratio 1.08→1.64）。诚实报告。
+> **三条 caveat（结论不能一锤定音的原因）**：① **单 ep 过拟合是错的测试**——泛化假设要在多 ep held-out 上验；轨迹图对单条轨迹已足够，数值通道只添噪。② **等预算/欠训**——A+num 多了 embedder 参数，同 1000 步/同 LR 可能欠训。③ **负对照 with zeros 不干净**——action 臂的 `none` 是「零动作过已训 embedder」≠ null（mask_token 路径），门本身对 action 臂略偏。
+>
+> **产物（本机，均在）**：runner `.cache/run_ablation.sh` + `.cache/eval_ablation.sh`，日志 `.cache/eval.log`；ckpt `models/train/ep0_{baseline,action}/step-{250,500,750,1000}.safetensors`（action ckpt 含 `action_embedder.*` 5 键，共 444 键，已验证保存）；eval 视频 `.cache/a2v_robotwin/eval/{base,act}_{real,none,shuffle}.mp4`；数据集 `.cache/a2v_robotwin/ep0_dataset_phys`（含 `actions.npy`）。
+>
+> **续接怎么做（下一步待用户拍板，三选一）**
+> 1. **多 ep held-out ablation（推荐，决定性测试）**：这才是泛化假设的正确门。建 train/held-out 集，两臂同配方训练，`eval_multiep` 对比 held-out。
+> 2. **廉价 LR/步数扫描**（action 臂）排除欠训：加步数 / 调 LR 再看是否翻盘。
+> 3. **接受当前负证据，搁置方案 A**。
+> - 复现：`bash .cache/run_ablation.sh`（训两臂）→ `bash .cache/eval_ablation.sh`（因果门对比）。开关 = `A2V_ACTION=1` 前缀。parity：`A2V_ACTION` 未设时 proj_out 零初始化 → 与基线逐位一致。
+>
+> ---
 >
 > ## §29 全量 RoboTwin clean_50 训练（2026-06-29，**新机器 `/disk/worldmodel`**）
 > **本会话在一台不同于历史记录的机器上工作**——历史段里的 `/vepfs/...` + `.venv` 路径不适用本机。
