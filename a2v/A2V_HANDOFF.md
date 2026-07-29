@@ -397,3 +397,52 @@ T6 A14B       → SEAM-5 (双专家MoE) + SEAM-4 i2v_vae(无CLIP) ✅ PASS (§18
   按用户指示**不再保留**；`simple_radius_gen_func` 现是修正后的 min-max 归一化（`normalized` 模式用）。
 - 走 ABot warm-start 的 T4 若需复现 ABot 控制图，须自行确认半径口径（旧 buggy 公式已不在仓库；用 `normalized` 近似或重训）。
 - 真实数据务必确认：`original_size` 与视频真实分辨率一致、外参是 c2w、夹爪量纲、H/W 为 16 倍数。
+
+---
+
+## DiT 域适配 playbook（预置策略，一声令下即开；**非待办**）
+
+> 这不是 §5 的待办项，而是一份**预先想清楚、随时可启动**的配方。默认**不做**（现状冻结预训练 DiT + 训 VACE
+> 已过因果门）；仅当下面的触发条件成立时，用户说一声即按本节落地。厘清：现在的 A2V 就是"冻 DiT、只训 VACE"，
+> 本 playbook 唯一新增的是在冻结**之前**插入一个**用无动作域内视频微调 DiT**的阶段一。
+
+### 何时开启（决策依据，先判断再动手）
+- **触发信号**：因果门/目视显示 REAL 的**场景外观本身不像域内**、或**机械臂运动物理不合理**（不是"控制没跟上轨迹"）。
+  若短板是"控制跟不上轨迹" → 那是 VACE 的活，域适配帮不上，别开。
+- **数据前提**：手上**无动作的域内视频 ≫ 带动作配对数据**，才有数据杠杆（用海量无标注视频适配 DiT，稀缺动作数据只喂 VACE）。
+- **现状已达标就不开**：省算力 + 避免遗忘。域适配是"锦上添花"，非必需（§16/§20 已证明无它也过门）。
+
+### 策略（推荐粒度）
+- **首选：DiT 域适配 LoRA**（在 action-free 视频上），成本/遗忘风险最低，14B 尤其推荐。
+- 备选：**全参微调 DiT**——仅当域差极大且愿付算力；风险 = 灾难性遗忘、丢通用先验。
+- 阶段一数据**只需 `video`**（无 `vace_video`、无动作、无 VACE 分支）：直接喂 manifest 的原始 mp4，或复用 prepare 的 PNG 列表。
+- 阶段一的**分辨率/帧数须与阶段二一致**（`4n+1`；H/W 整除因子按 spec）。
+
+### 铁律 / 注意事项
+1. **阶段二一定冻 DiT**：把阶段一的适配"焊死"进冻结 DiT（合并权重，或作为 **frozen preset LoRA**），阶段二只训 VACE。
+   这样 `real` vs `none` 的差异**全部来自 VACE** → 因果归因干净（评测判据靠的就是这个分离度）。
+2. **别在阶段二解冻 DiT 联合训**：否则控制会被 DiT 吸收，`gen(real)≈gen(none)`，因果门变糊（与 §11「LoRA 训不动 from-DiT」同源的教训）。
+3. **遗忘**：窄域微调会削弱通用视频先验。只做机器人视频无所谓；要保留泛化就用 LoRA + 适度步数，别全参猛训。
+4. **强首帧基模收益打折**：i2v/ti2v 外观已被 GT 首帧锚定（§19 结论：首帧机制主导像素保真度）。对这类基模，域适配主要还能帮
+   **运动物理合理性**，不是长相——先用因果门/目视判断短板在外观还是在控制，再决定值不值得付这笔成本。
+5. **encoded-cache 可直接复用**：cache 存的是**编码器输出**（`input_latents`=VAE 编 GT 视频、`context`=T5、`vace_context`=VAE 编轨迹图、i2v 另含 clip/y），
+   **均与 DiT 无关**。所以换了 DiT（新权重/挂 LoRA）后，阶段二**不必重编码**，老 cache 照用。
+6. **14B 分片坑**：全参适配后 DiT 是新权重，而 spec 的 DiT 路径是多分片。阶段二消费要么合并回分片/单文件再覆盖 `--model_paths`，
+   要么走 LoRA 路避免动分片——**这正是首选 LoRA 的原因之一**。
+
+### 落地配方（两条路，二选一）
+- **路 A（推荐：LoRA，最小侵入）**
+  - 阶段一：在 action-free 视频上训 DiT LoRA（`--lora_base_model dit --lora_target_modules "q,k,v,o,ffn.0,ffn.2"`，lr≈1e-4/1.3B、1e-5/14B，cosine），产出 `dit_adapt` LoRA。
+  - 阶段二：照常 `bash a2v/train.sh <spec>` 训 vace，额外把 `dit_adapt` LoRA 作为**冻结 preset** 挂在 DiT 上
+    （stock 支持 `--preset_lora_path <ckpt> --preset_lora_model dit`）；`infer_a2v` 推理时同样加载该 preset。
+- **路 B（全参）**
+  - 阶段一：`--trainable_models dit` 全参微调 action-free 视频。
+  - 阶段二：用适配后的 DiT 覆盖 spec 的 DiT 路径（`--model_paths` 或改 `A2V_MODELS_DIR` 布局；14B 需先处理分片），冻结后训 vace。
+
+### 一声令下要做的最小接线（当前 gap，诚实标注）
+`train.sh` 现在**只训 vace**、且总是 `provision_a2v` + 需要 `vace_video`。开启阶段一需二选一（都是小改）：
+- **零改动路**：直接用 stock `examples/wanvideo/model_training/train.py`（喂 mp4、`--trainable_models dit` 或 dit LoRA），A2V 侧一行不动；或
+- **加分支路**：给 `train_a2v.py`/`train.sh` 加 `DIT_ADAPT=1` 分支——跳过 `provision_a2v`、置 `--trainable_models dit`（或 dit LoRA）、`data_file_keys` 只留 `video`。
+- 若阶段二走 preset-LoRA（路 A），把 `--preset_lora_path/--preset_lora_model` 透出成 `train.sh` 的 env（`train_a2v.py` 已把二者透传给 module，缺的只是 `train.sh` 没暴露）。
+
+> **接手提示**：用户说"开启 DiT 域适配"时，先回本节确认触发条件成立 → 选路 A/B → 补上对应最小接线 → 阶段一训练 → 阶段二冻结 DiT 训 vace → 走 Step 4 因果门。
