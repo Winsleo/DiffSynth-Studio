@@ -39,6 +39,32 @@ from a2v.provision import ensure_vace, provision_a2v  # noqa: E402
 from a2v.train_logging import A2VModelLogger, PeriodicSampler, a2v_launch_training_task  # noqa: E402
 
 
+def _inject_dit_ckpt(pipe, ckpt_path: str) -> None:
+    """Load a full-DiT .safetensors and inject into pipe.dit (in-place).
+
+    Used by Option A training: warm-start pipe.dit from a pretrained robot-trained
+    checkpoint BEFORE ensure_vace clones VACE blocks from it. Expects keys to
+    match pipe.dit's state_dict (e.g. blocks.X.*, time_embedding.*,
+    time_projection.*).
+    """
+    from safetensors import safe_open
+    import time as _time
+    print(f"[a2v][init_dit] loading {ckpt_path}", flush=True)
+    t0 = _time.perf_counter()
+    sd = {}
+    with safe_open(ckpt_path, framework="pt") as f:
+        for k in f.keys():
+            sd[k] = f.get_tensor(k)
+    print(f"[a2v][init_dit] loaded {len(sd)} keys in {_time.perf_counter()-t0:.1f}s", flush=True)
+    missing, unexpected = pipe.dit.load_state_dict(sd, strict=False)
+    if unexpected:
+        print(f"[a2v][init_dit] WARN {len(unexpected)} unexpected keys (e.g. {unexpected[:3]})", flush=True)
+    if missing:
+        print(f"[a2v][init_dit] WARN {len(missing)} missing keys (e.g. {missing[:3]})", flush=True)
+    if not missing and not unexpected:
+        print(f"[a2v][init_dit] ✅ perfect match — pipe.dit initialised from ckpt", flush=True)
+
+
 def _load_stock_train_module():
     """Import the stock Wan training module by file path (it is not a package)."""
     stock_path = REPO_ROOT / "examples" / "wanvideo" / "model_training" / "train.py"
@@ -61,11 +87,29 @@ def _make_training_module_cls(stock):
     """
 
     class A2VWanTrainingModule(stock.WanTrainingModule):
-        def __init__(self, *args, a2v_spec=None, **kwargs):
+        def __init__(self, *args, a2v_spec=None, init_dit_ckpt=None, **kwargs):
             # Set before super().__init__ (which calls switch_*). Bypass nn.Module's
             # __setattr__ since _parameters/_modules don't exist yet at this point.
             object.__setattr__(self, "_a2v_spec", a2v_spec)
-            super().__init__(*args, **kwargs)
+            # For T3 (TI2V-5B etc.: has_pretrained_vace=False), the VACE branch is built
+            # from DiT via `ensure_vace`. But stock `WanTrainingModule.__init__` calls
+            # `resume_from_checkpoint` at train.py:40 — BEFORE `switch_pipe_to_training_mode`
+            # at train.py:43, which is where we hook `ensure_vace`. Result: resume sees
+            # `self.state_dict()` without `pipe.vace.vace_blocks.*` → "439 keys unexpected".
+            # Fix: stash the resume args, call super() with resume_from_checkpoint=None,
+            # build vace, then resume manually with vace already in place.
+            _resume_path = kwargs.pop("resume_from_checkpoint", None)
+            _resume_prefix = kwargs.pop("remove_prefix_in_ckpt", None)
+            super().__init__(resume_from_checkpoint=None, remove_prefix_in_ckpt=None, *args, **kwargs)
+            # Option A: warm-start pipe.dit from a pre-trained full-DiT checkpoint BEFORE
+            # ensure_vace clones the VACE blocks from it. Result: VACE blocks are
+            # initialised from a robot-trained DiT (e.g. the 58-point leaderboard
+            # ckpt from the prior 6-node training run), not the stock TI2V-5B base.
+            if init_dit_ckpt:
+                _inject_dit_ckpt(self.pipe, init_dit_ckpt)
+            if a2v_spec is not None and _resume_path is not None:
+                ensure_vace(self.pipe, a2v_spec)  # build vace from DiT so state_dict has vace keys
+                self.resume_from_checkpoint(_resume_path, _resume_prefix)
 
         def switch_pipe_to_training_mode(self, pipe, *args, **kwargs):
             if getattr(self, "_a2v_spec", None) is not None:
@@ -134,6 +178,12 @@ def main() -> None:
                              "Loads ONLY the DiT (T5/VAE/CLIP outputs come from the cache, so those "
                              "encoders are not loaded -> big VRAM + time saving) and reads cached .pth "
                              "tensors via load_from_cache (dataset_base_path = cache dir).")
+    parser.add_argument("--init_dit_ckpt", default=None,
+                        help="Path to a full-DiT checkpoint (.safetensors) to inject into pipe.dit "
+                             "AFTER from_pretrained but BEFORE ensure_vace. Use this when you want "
+                             "VACE to be created from a pre-trained DiT (warm-start VACE blocks "
+                             "from a non-default base). Keys must match pipe.dit's state_dict "
+                             "(e.g. blocks.X.*, time_embedding.*, time_projection.*).")
     # --- observability (a2v.train_logging): richer scalars + in-training sampling ---
     parser.add_argument("--log_every", type=int, default=10,
                         help="Log lr/grad_norm/throughput/gpu_mem every N steps (loss is logged every step).")
@@ -157,6 +207,21 @@ def main() -> None:
     # the stock "pipe.dit." fallback after the spec branch when no spec is given.
     parser.set_defaults(remove_prefix_in_ckpt=None)
     args = parser.parse_args()
+
+    # --- preload cache patch (A2V_TRAIN_GUIDE: avoid lazy LoadTorchPickle) ---
+    try:
+        from preload_cache_patch import install_preload_patch
+        install_preload_patch()
+    except Exception as _e:
+        print(f"[a2v] preload_cache_patch import failed: {_e}", flush=True)
+
+    # --- variable-length training patch (Phase 3) ---
+    try:
+        sys.path.insert(0, "/disk/worldmodel/wangshilong/a2v_v4_khl/scripts")
+        from varlen_patch import install_varlen_patch
+        install_varlen_patch()
+    except Exception as _e:
+        print(f"[a2v] varlen_patch import failed: {_e}", flush=True)
 
     # --- spec-driven defaults (T2): explicit CLI always wins ---
     spec = get_spec(args.base_spec) if args.base_spec else None
@@ -224,6 +289,7 @@ def main() -> None:
     training_module_cls = _make_training_module_cls(stock)
     model = training_module_cls(
         a2v_spec=spec,
+        init_dit_ckpt=args.init_dit_ckpt,
         model_paths=args.model_paths,
         model_id_with_origin_paths=args.model_id_with_origin_paths,
         tokenizer_path=args.tokenizer_path,
