@@ -307,6 +307,7 @@ def a2v_launch_training_task(
         torch.cuda.reset_peak_memory_stats()
 
     for epoch_id in range(num_epochs):
+        print(f"[a2v_debug] epoch {epoch_id} begin, dataloader has {len(dataloader)} iters", flush=True)
         for data in dataloader:
             with accelerator.accumulate(model):
                 if dataset.load_from_cache:
@@ -319,6 +320,8 @@ def a2v_launch_training_task(
 
                 step += 1
                 do_log = (step % log_every == 0)
+                if step <= 3:
+                    print(f"[a2v_debug] step {step} done, loss={loss.item():.4f}", flush=True)
 
                 # grad norm must be read before zero_grad; gate by log cadence (cost on 14B)
                 grad_norm = _grad_norm(model) if (do_log and log_grad_norm) else None
